@@ -1,0 +1,29 @@
+[project]
+name = "macro-mcp"
+version = "0.1.0"
+description = "Nutrition logging and adaptive expenditure estimation, exposed to Claude over MCP"
+requires-python = ">=3.11"
+license = { text = "MIT" }
+dependencies = [
+    "python-dotenv>=1.0",
+    "tzdata>=2024.1; sys_platform == 'win32'",
+    "fastmcp",
+]
+
+[project.optional-dependencies]
+dev = [
+    "pytest>=8.0",
+]
+
+[build-system]
+requires = ["setuptools>=68"]
+build-backend = "setuptools.build_meta"
+
+[tool.setuptools.packages.find]
+where = ["src"]
+
+[tool.pytest.ini_options]
+testpaths = ["tests"]
+markers = [
+    "integration: exercises the real, running garmin-mcp instance (read-only), skipped by default; see tests/test_garmin_client.py for the env vars that opt in.",
+]
