@@ -19,6 +19,7 @@ import sqlite3
 from datetime import date as Date, timedelta
 from typing import Any
 
+from .foods import ATWATER_TOLERANCE
 from .models import Macros, ValidationError, iso, now, require, today
 from .store import transaction
 from .targets import WeekResolution, resolve_week, week_start
@@ -245,6 +246,26 @@ def set_day_plan(
         except TypeError as exc:
             raise ValidationError(f"invalid macros field(s): {exc}") from exc
         m.validate()
+
+        # Derive energy from the macros when the caller didn't supply it. Macros.kcal
+        # defaults to 0.0, so passing only protein/carb/fat silently stored a 0-calorie
+        # target -- not merely a cosmetic display bug: resolve_week subtracts
+        # explicit_kcal_total from the weekly budget, so a 0 there makes the week believe
+        # an explicit day is free and over-allocates that day's real energy as carbs across
+        # the remaining days.
+        #
+        # Deriving is correct here in a way it deliberately is NOT for logged food. A logged
+        # entry has a user-stated calorie figure worth preserving verbatim (log_food only
+        # *reports* an Atwater mismatch, never rewrites it). A target is a specification --
+        # 190P/60C/32F has one well-defined energy content and there is no competing stated
+        # value to overwrite.
+        implied = m.implied_kcal()
+        derived_kcal = False
+        if m.kcal == 0 and implied > 0:
+            m = Macros(kcal=implied, protein_g=m.protein_g, carb_g=m.carb_g,
+                       fat_g=m.fat_g, fiber_g=m.fiber_g)
+            derived_kcal = True
+
         resolved_macros = m.as_dict()
         explicit_json = json.dumps(resolved_macros)
 
@@ -260,7 +281,22 @@ def set_day_plan(
                    updated_at = excluded.updated_at""",
             (target, day_type, explicit_json, stamp),
         )
-    return {"ok": True, "day": target, "day_type": day_type, "explicit_macros": resolved_macros}
+    result = {"ok": True, "day": target, "day_type": day_type, "explicit_macros": resolved_macros}
+    if day_type is None:
+        if derived_kcal:
+            result["kcal_derived_from_macros"] = True
+            result["note"] = (
+                f"kcal wasn't supplied, so it was derived from the macros via Atwater "
+                f"(4/4/9) as {resolved_macros['kcal']:.0f}. Pass kcal explicitly to override."
+            )
+        elif implied > 0 and abs(implied - m.kcal) / max(implied, m.kcal) > ATWATER_TOLERANCE:
+            # Supplied kcal is kept as-is -- only flagged, matching log_food's behaviour of
+            # never silently rewriting a number the caller stated.
+            result["warning"] = (
+                f"stated {m.kcal:.0f} kcal vs {implied:.0f} implied by the macros "
+                f"({abs(implied - m.kcal):.0f} apart). Stored as given."
+            )
+    return result
 
 
 # --- weekly resolution composition --------------------------------------------------

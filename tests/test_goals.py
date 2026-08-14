@@ -256,3 +256,76 @@ def test_get_targets_explicit_macros_override(db):
     result = goals.get_targets(db, day="2026-08-12", tdee=2600.0, trend_weight_lb=190.0)
     assert result["source"] == "explicit"
     assert result["kcal"] == 1999
+
+
+# --- explicit-macro energy derivation (regression) -----------------------------------
+
+
+def test_explicit_macros_derive_kcal_when_not_supplied(db):
+    """Regression: Macros.kcal defaults to 0.0, so passing only protein/carb/fat stored a
+    0-calorie target. Not cosmetic -- resolve_week subtracts explicit_kcal_total from the
+    weekly budget, so a 0 made the week treat that day as free and over-allocate its real
+    energy as carbs across the remaining days.
+    """
+    r = goals.set_day_plan(db, "2026-08-14",
+                           macros={"protein_g": 190, "carb_g": 60, "fat_g": 32})
+    assert r["explicit_macros"]["kcal"] == pytest.approx(190 * 4 + 60 * 4 + 32 * 9)
+    assert r["kcal_derived_from_macros"] is True
+
+
+def test_derived_kcal_is_persisted_not_just_returned(db):
+    goals.set_day_plan(db, "2026-08-14",
+                       macros={"protein_g": 190, "carb_g": 60, "fat_g": 32})
+    import json
+    row = db.execute("SELECT explicit_macros FROM day_plan WHERE day = '2026-08-14'").fetchone()
+    assert json.loads(row["explicit_macros"])["kcal"] == pytest.approx(1288)
+
+
+def test_supplied_kcal_is_never_overwritten(db):
+    """A caller-stated figure is kept verbatim even if it disagrees with Atwater -- same
+    principle as log_food, which reports a mismatch rather than rewriting the number.
+    """
+    # 2000 vs 1288 implied is ~36% apart, comfortably outside ATWATER_TOLERANCE (20%).
+    # (1500 would only be 14% apart and correctly produces no warning.)
+    r = goals.set_day_plan(db, "2026-08-14",
+                           macros={"kcal": 2000, "protein_g": 190, "carb_g": 60, "fat_g": 32})
+    assert r["explicit_macros"]["kcal"] == 2000
+    assert "kcal_derived_from_macros" not in r
+    assert "warning" in r
+
+
+def test_supplied_kcal_matching_atwater_produces_no_warning(db):
+    r = goals.set_day_plan(db, "2026-08-14",
+                           macros={"kcal": 1288, "protein_g": 190, "carb_g": 60, "fat_g": 32})
+    assert r["explicit_macros"]["kcal"] == 1288
+    assert "warning" not in r
+
+
+def test_explicit_day_energy_counts_against_the_weekly_budget(db):
+    """The end-to-end consequence of the fix: the explicit day carries its real energy into
+    the week's accounting, so the seven resolved days still sum to the weekly budget.
+
+    Deliberately asserts that invariant rather than "the other days get fewer carbs". The
+    direction of that effect depends on whether the explicit day is above or below what a
+    resolved day would have been -- this 1288 kcal day is *below* average, so its neighbours
+    actually get MORE carbs, not fewer. (Same trap as
+    test_explicit_day_lighter_than_average_leaves_more_carbs_for_the_rest in test_targets.py;
+    the summing invariant is direction-independent and is what the bug actually broke.)
+    """
+    from macro_mcp.targets import resolve_week
+
+    goals.set_goal(db, "cut", -1.0, 1.0, 0.35, "none", None)
+    goals.set_day_plan(db, "2026-08-14",
+                       macros={"protein_g": 190, "carb_g": 60, "fat_g": 32})
+
+    resolution, reason = goals.resolve_current_week(
+        db, tdee=2600.0, trend_weight_lb=190.0, week_of=date(2026, 8, 13),
+    )
+    assert reason is None
+
+    explicit_day = resolution.target_for("2026-08-14")
+    assert explicit_day.explicit is True
+    assert explicit_day.macros.kcal == pytest.approx(1288)  # not 0, which was the bug
+
+    total = sum(d.macros.kcal for d in resolution.days)
+    assert total == pytest.approx(resolution.weekly_budget_kcal, abs=0.01)

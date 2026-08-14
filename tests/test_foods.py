@@ -298,7 +298,20 @@ def test_trend_avg_is_null_with_reason_when_nothing_complete(db):
     assert trend["avg_kcal_null_reason"]
 
 
-def test_get_day_targets_are_null_with_reason_in_m1(db):
+def test_get_day_does_not_resolve_targets_at_this_layer(db):
+    """foods.get_day is the raw log layer -- no access to the active goal or to garmin-mcp's
+    weight data -- so it always returns targets as null, with a reason pointing at the layer
+    that does resolve them (server.py's get_day tool / goals.get_targets).
+
+    Asserts the *contract* rather than exact wording. The original version pinned the literal
+    string "M3", which encoded a temporary build state as a permanent assertion: it kept
+    passing after the target engine shipped, so the suite ended up defending a stale message
+    that read as "this feature doesn't exist" long after it did.
+    """
     day = foods.get_day(db, "2026-01-01")
     assert day["targets"] is None
-    assert "M3" in day["targets_null_reason"]
+    assert day["remaining"] is None
+    reason = day["targets_null_reason"]
+    assert reason and "get_targets" in reason
+    # must not imply the feature is unbuilt -- that's what made the old message misleading
+    assert "not implemented" not in reason.lower()

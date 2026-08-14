@@ -567,8 +567,20 @@ def get_day(conn: sqlite3.Connection, day: Date | str | None = None) -> dict[str
         "planned_totals": planned.as_dict() if planned.kcal else None,
         "entries": list(entries.values()),
         "entry_count": len(entries),
+        # Targets are deliberately not resolved here. This module is the raw food-log layer
+        # and has no access to the active goal or to garmin-mcp's weight data; server.py's
+        # get_day tool overlays real targets (or a specific reason they're unavailable) on
+        # top of this. Callers that use this function directly -- notably scripts/log_cli.py
+        # -- get this placeholder instead, so it must describe *that* situation accurately
+        # rather than the state of the codebase. It previously read "target engine not
+        # implemented until M3", which was true when written but became misleading once the
+        # engine shipped: read out of context it implied a missing feature rather than an
+        # unset goal.
         "targets": None,
-        "targets_null_reason": "target engine not implemented until M3",
+        "targets_null_reason": (
+            "not resolved by this layer -- use the get_day MCP tool or get_targets, which "
+            "apply the active goal and current expenditure"
+        ),
         "remaining": None,
         "confidence_mix": _confidence_mix(rows),
     }
