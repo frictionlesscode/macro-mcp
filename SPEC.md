@@ -1,7 +1,7 @@
 # macro-mcp — Build Spec
 
 A remote MCP server for nutrition logging and adaptive expenditure estimation, designed to run
-alongside [garmin-mcp](../../ClaudeGarminConnect/garmin-mcp) and be driven from Claude on mobile.
+alongside [garmin-mcp](https://github.com/frictionlesscode/garmin-mcp) and be driven from Claude on mobile.
 
 ---
 
