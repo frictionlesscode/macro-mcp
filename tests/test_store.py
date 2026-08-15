@@ -7,17 +7,20 @@ def test_schema_initialises_with_version(db):
     assert schema_version(db) == SCHEMA_VERSION
 
 
-def test_day_types_are_seeded(db):
-    rows = db.execute("SELECT name FROM day_type ORDER BY name").fetchall()
-    assert [r["name"] for r in rows] == ["heavy", "moderate", "rest"]
-
-
-def test_seeding_is_idempotent(db):
+def test_schema_init_is_idempotent(db):
+    """No seeded reference data exists to check counts on since the charter change removed
+    day_type (SPEC.md "Charter change (2026-08-14)") -- what's left to verify is just that
+    re-running init_schema against an already-initialised database doesn't raise.
+    """
     from macro_mcp.store import init_schema
 
-    init_schema(db)
-    count = db.execute("SELECT COUNT(*) c FROM day_type").fetchone()["c"]
-    assert count == 3
+    init_schema(db)  # must not raise on a database that already has these tables
+    assert schema_version(db) == SCHEMA_VERSION
+
+
+def test_day_target_table_exists_and_is_empty_on_init(db):
+    rows = db.execute("SELECT * FROM day_target").fetchall()
+    assert rows == []
 
 
 def test_absent_day_is_unlogged_not_zero(db):

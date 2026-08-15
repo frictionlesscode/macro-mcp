@@ -1,35 +1,37 @@
-"""FastMCP app and tool registration -- M3: local only, no auth, no Docker.
+"""FastMCP app and tool registration.
 
-Mirrors garmin-mcp's server.py conventions (same fastmcp version, @mcp.tool / @mcp.custom_route
-pattern, streamable-http invocation) so the two servers stay easy to run and reason about side
-by side.
-
-Run directly for local dev / MCP Inspector, or via `scripts/mcp_smoke.py`'s automated check:
+Mirrors garmin-mcp's server.py conventions (same fastmcp version, @mcp.tool /
+@mcp.custom_route pattern, streamable-http invocation) so the two servers stay easy to run and
+reason about side by side.
 
     python -m macro_mcp.server
 
-Scope note: this now exposes food logging, the personal library, the expenditure engine, body
-composition, and the full targets/goals engine (weekly-budget resolution, day planning, goal
-lifecycle -- see targets.py/goals.py, SPEC.md's M5.5). It does NOT yet expose get_weekly_review
-or the proposal table (get_proposals/accept_proposal/decline_proposal) -- both belong with M7's
-nightly recompute, which doesn't exist yet; tracked as follow-up work, not silently dropped.
+Scope: food logging, the personal library, stored targets, intake-vs-target reporting, trend
+statistics, SVG charting, body composition, and progress photos (with a token-gated
+/dashboard page combining photos with weight and body-fat trend).
+
+Deliberately absent -- TDEE estimation, goals, and target derivation. Those were built and
+then removed; see SPEC.md "Charter change (2026-08-14)". Claude owns the goal, the plan, the
+cadence, and the numbers; this server records what it was told and measures what happened
+against it. If a capability would require the server to hold an opinion about nutrition, it
+does not belong here.
 """
 
 from __future__ import annotations
 
-import dataclasses
+import base64
+import hmac
 import logging
 import os
 from contextlib import contextmanager
 from importlib.metadata import PackageNotFoundError, version as pkg_version
 from typing import Any, Iterator
 
-import httpx
 from fastmcp import FastMCP
 from starlette.requests import Request
-from starlette.responses import JSONResponse
+from starlette.responses import HTMLResponse, JSONResponse, PlainTextResponse, Response
 
-from macro_mcp import body, expenditure, foods, garmin_client, goals
+from macro_mcp import body, body_photos, charts, dashboard, foods, targets as targets_mod, trends
 from macro_mcp.models import MACRO_FIELDS
 from macro_mcp.oauth import SingleUserOAuthProvider
 from macro_mcp.store import db_path, open_db
@@ -56,29 +58,6 @@ def _db() -> Iterator[Any]:
         conn.close()
 
 
-async def _current_expenditure(days: int = 28) -> expenditure.ExpenditureResult:
-    """Shared by get_expenditure, get_targets, get_day, set_goal, and get_goal -- one place
-    that knows how to talk to garmin-mcp and degrade honestly, so every tool that needs a
-    TDEE/trend-weight gets the identical fail-closed behavior rather than five copies of it.
-    """
-    with _db() as conn:
-        intake_points = foods.get_intake_trend(conn, days=days)["points"]
-    try:
-        # More history than the analysis window, so the trend's EWMA has room to warm up
-        # before the window it's actually judged over begins -- see garmin_client's own
-        # docstring on get_weight_points.
-        weight_points = await garmin_client.get_weight_points(days=days + 60)
-    except garmin_client.GarminBridgeError as exc:
-        result = expenditure.compute_expenditure(intake_points, [], window_days=days)
-        return dataclasses.replace(result, tdee_null_reason=str(exc))
-    return expenditure.compute_expenditure(intake_points, weight_points, window_days=days)
-
-
-def _latest_percent_fat(conn) -> float | None:
-    latest = body.get_body_comp(conn, days=90)["latest"]
-    return latest["percent_fat"] if latest else None
-
-
 def _server_version() -> str:
     try:
         return pkg_version("macro-mcp")
@@ -95,35 +74,66 @@ def _db_status() -> dict:
         return {"ok": False, "path": str(db_path()), "error": str(exc)}
 
 
-async def _garmin_mcp_status() -> dict:
-    """A lightweight reachability probe -- hits garmin-mcp's own unauthenticated /health,
-    not a full OAuth login (that's real work, not appropriate to redo on every health check).
-
-    Kept short deliberately: a health check that blocks for several seconds on one
-    downstream dependency being slow to fail is itself a problem, independent of how long
-    that dependency actually takes to answer.
-    """
-    base = garmin_client._base_url()
-    try:
-        async with httpx.AsyncClient(timeout=1.5) as http:
-            resp = await http.get(f"{base}/health")
-        return {"reachable": resp.status_code == 200, "url": base, "status_code": resp.status_code}
-    except Exception as exc:  # noqa: BLE001 -- a malformed GARMIN_MCP_URL (e.g. a bad port
-        # number) can raise well below httpx's own exception hierarchy (OverflowError from
-        # asyncio's socket layer, observed live during M5's Docker verification) -- like
-        # _db_status above, this health check must never itself raise, no matter why the
-        # downstream is unreachable.
-        return {"reachable": False, "url": base, "error": f"{exc.__class__.__name__}: {exc}"}
-
-
 @mcp.custom_route("/health", methods=["GET"], include_in_schema=False)
 async def health(request: Request) -> JSONResponse:
     return JSONResponse({
         "status": "ok",
         "version": _server_version(),
         "db": _db_status(),
-        "garmin_mcp": await _garmin_mcp_status(),
     })
+
+
+def _dashboard_authorized(request: Request) -> bool:
+    """The dashboard is reachable over the same public Tailscale Funnel as the MCP
+    endpoint (SPEC.md's "Locked decisions"), so it needs its own gate: a plain browser GET
+    has no OAuth bearer to check. DASHBOARD_TOKEN is deliberately separate from
+    MCP_BEARER_TOKEN -- a leaked photo-viewing link (pasted into a chat, sitting in browser
+    history) shouldn't also be a working MCP credential. Unset means the dashboard is
+    disabled, not open -- fail closed, not open-by-default.
+    """
+    configured = os.environ.get("DASHBOARD_TOKEN", "")
+    if not configured:
+        return False
+    supplied = request.query_params.get("token", "")
+    return hmac.compare_digest(supplied, configured)
+
+
+@mcp.custom_route("/dashboard", methods=["GET"], include_in_schema=False)
+async def dashboard_page(request: Request) -> Response:
+    if not os.environ.get("DASHBOARD_TOKEN"):
+        return PlainTextResponse(
+            "dashboard disabled: set DASHBOARD_TOKEN to enable it", status_code=503
+        )
+    if not _dashboard_authorized(request):
+        return PlainTextResponse("unauthorized", status_code=401)
+
+    angle = request.query_params.get("angle", "front")
+    if angle not in ("front", "side", "back"):
+        return PlainTextResponse(f"unknown angle {angle!r}", status_code=400)
+    try:
+        days = int(request.query_params.get("days", "90"))
+    except ValueError:
+        return PlainTextResponse("days must be an integer", status_code=400)
+
+    token = request.query_params["token"]
+    with _db() as conn:
+        html = await dashboard.render_page(conn, angle, days, token)
+    return HTMLResponse(html)
+
+
+@mcp.custom_route("/dashboard/photo", methods=["GET"], include_in_schema=False)
+async def dashboard_photo(request: Request) -> Response:
+    if not _dashboard_authorized(request):
+        return PlainTextResponse("unauthorized", status_code=401)
+
+    day = request.query_params.get("day", "")
+    angle = request.query_params.get("angle", "front")
+    with _db() as conn:
+        try:
+            data, _status = body_photos.aligned_jpeg_bytes(conn, day, angle)
+        except Exception as exc:  # noqa: BLE001 -- a bad/missing day must 404, never 500
+            return PlainTextResponse(str(exc), status_code=404)
+    return Response(content=data, media_type="image/jpeg")
 
 
 # --- logging -------------------------------------------------------------------
@@ -203,7 +213,7 @@ def edit_item(
 ) -> dict:
     """Correct one logged food item (not a whole meal) by its item_id. Only the
     fields you pass are changed. Retroactive corrections are expected and cheap --
-    the expenditure engine recomputes from scratch, it doesn't need to be told.
+    trends recompute from what's stored, they don't need to be told.
     """
     fields = {
         "name": name, "qty": qty, "unit": unit, "kcal": kcal, "protein_g": protein_g,
@@ -232,9 +242,9 @@ def delete_item(item_id: int) -> dict:
 @mcp.tool
 def set_day_status(date: str | None = None, status: str = "complete", notes: str | None = None) -> dict:
     """Mark how completely a day was logged: "complete" (nothing missing --
-    only complete days count toward the expenditure estimate), "partial", or
-    "unlogged". Defaults to today. Marking a day complete is an assertion, not
-    inferred automatically from having logged something.
+    only complete days count toward trend statistics), "partial", or "unlogged".
+    Defaults to today. Marking a day complete is an assertion, not inferred
+    automatically from having logged something.
     """
     with _db() as conn:
         return foods.set_day_status(conn, date, status, notes)
@@ -290,37 +300,29 @@ def search_library(query: str = "", limit: int = 10) -> list[dict]:
 
 
 @mcp.tool
-async def get_day(date: str | None = None) -> dict:
-    """Everything logged on a day, with totals. Defaults to today. `targets`
-    and `remaining` are populated when an active goal exists and TDEE/weight
-    data is available; otherwise both stay null with `targets_null_reason`
-    explaining why (e.g. "no active goal set", or the same reason
-    get_expenditure would give if weight/TDEE data isn't there yet).
+def get_day(date: str | None = None) -> dict:
+    """Everything logged on a day, with totals and how they compare to that
+    day's stored targets. Defaults to today.
+
+    `targets` is exactly what was set via set_targets for this date -- this
+    server never derives targets, so if none were set this returns null with a
+    reason rather than computing something. `remaining` is signed: negative
+    means over target; `over` lists which macros are currently exceeded.
     """
     with _db() as conn:
         day = foods.get_day(conn, date)
-        has_goal = goals.has_active_goal(conn)
+        stored = targets_mod.get_targets(conn, day["date"])
 
-    if not has_goal:
-        day["targets_null_reason"] = "no active goal set (see set_goal)"
-        day["day_type"] = None
-        day["remaining"] = None
-        return day
-
-    exp = await _current_expenditure()
-    with _db() as conn:
-        target = goals.get_targets(conn, day["date"], tdee=exp.tdee, trend_weight_lb=exp.trend_weight_lb)
-
-    day["day_type"] = target["day_type"]
-    day["targets_null_reason"] = target["targets_null_reason"]
-    if target["targets_null_reason"] is None:
-        day["targets"] = {k: target[k] for k in MACRO_FIELDS}
-        day["remaining"] = {
-            k: round(target[k] - day["totals"][k], 1) for k in MACRO_FIELDS
-        }
+    day["targets"] = stored["targets"]
+    day["targets_null_reason"] = stored["targets_null_reason"]
+    day["target_note"] = stored["note"]
+    comparison = targets_mod.compare(day["totals"], stored["targets"])
+    if comparison:
+        day["remaining"] = comparison["remaining"]
+        day["over"] = comparison["over"]
     else:
-        day["targets"] = None
         day["remaining"] = None
+        day["over"] = None
     return day
 
 
@@ -334,20 +336,111 @@ def get_intake_trend(days: int = 28) -> dict:
         return foods.get_intake_trend(conn, days)
 
 
-@mcp.tool
-async def get_expenditure(days: int = 28) -> dict:
-    """Estimate TDEE from energy balance: recency-weighted average intake over
-    complete-logged days, adjusted by the trend-weight change over the same
-    window. Returns tdee: null with a stated reason if there isn't enough
-    data -- never a number the data doesn't support.
+# --- targets -----------------------------------------------------------------------
 
-    Weight data comes from garmin-mcp over its own MCP connection. If
-    garmin-mcp is unreachable or login fails, this degrades honestly: tdee
-    comes back null with a reason naming the garmin-mcp problem specifically,
-    never a fabricated or stale-but-unlabeled number.
+
+@mcp.tool
+def set_targets(targets: list[dict]) -> dict:
+    """Store macro targets for one or more dates, replacing any already set.
+
+    Each entry needs `date`, `protein_g`, `carb_g`, `fat_g`; optional `kcal`,
+    `fiber_g`, `note`. If `kcal` is omitted it's derived from the macros via
+    Atwater (4/4/9) and reported back -- a target is a specification with one
+    well-defined energy content. (Logged food is the opposite: its stated
+    calories are never rewritten, only flagged.)
+
+    Bulk on purpose. This server holds no notion of day types, recurrence, or
+    training plans -- you decide the cadence and write each date explicitly, so
+    a month-long protocol should be one call rather than thirty. The whole
+    batch is validated before anything is written.
     """
-    result = await _current_expenditure(days)
-    return result.as_dict()
+    with _db() as conn:
+        return targets_mod.set_targets(conn, targets)
+
+
+@mcp.tool
+def get_targets(date: str | None = None) -> dict:
+    """The macro targets stored for a date, or null with a reason if none were
+    set. Defaults to today. Nothing is derived -- this returns exactly what was
+    written by set_targets.
+    """
+    with _db() as conn:
+        return targets_mod.get_targets(conn, date)
+
+
+@mcp.tool
+def delete_targets(date: str) -> dict:
+    """Remove the stored targets for a date. `existed` says whether there were
+    any to remove, so a no-op is distinguishable from a real deletion.
+    """
+    with _db() as conn:
+        return targets_mod.delete_targets(conn, date)
+
+
+# --- trends and charts -----------------------------------------------------------------
+
+
+@mcp.tool
+def get_trend(days: int = 28, metrics: list[str] | None = None) -> dict:
+    """Intake vs targets over a trailing window, with adherence statistics.
+
+    Returns a per-metric series (intake and target per date), plus averages and
+    adherence: how often intake landed over, under, or within a tolerance band
+    of target, with the signed mean deviation (bias) reported separately from
+    the absolute mean (scatter) -- a steady small overshoot and wild swings
+    averaging to zero are different problems.
+
+    Unlogged days are excluded from every statistic rather than counted as
+    zero. Below a minimum number of complete days the statistics come back null
+    with a reason instead of a figure computed from too little data; `coverage`
+    always reports how many days actually contributed.
+    """
+    chosen = metrics or list(MACRO_FIELDS)
+    with _db() as conn:
+        points = foods.get_intake_trend(conn, days=days)["points"]
+        if points:
+            by_day = targets_mod.get_targets_range(conn, points[0]["date"], points[-1]["date"])
+        else:
+            by_day = {}
+    return trends.compute(points, by_day, metrics=chosen)
+
+
+@mcp.tool
+def render_trend(days: int = 28, metric: str = "kcal", chart: str = "line") -> dict:
+    """Render a trend as an inline SVG chart, ready to display directly.
+
+    `chart="line"` plots intake over time against the target as a dashed
+    reference line with a tolerance band. `chart="deviation"` plots per-day
+    distance from target as bars, coloured over/under/on-target.
+
+    Unlogged days are gaps in the line, never points at zero. Every data point
+    carries a native hover tooltip, so the chart is interactive without any
+    JavaScript. Returns `svg: null` with a reason when there's nothing
+    plottable.
+    """
+    if chart not in ("line", "deviation"):
+        raise ValueError(f"chart must be 'line' or 'deviation'; got {chart!r}")
+
+    with _db() as conn:
+        points = foods.get_intake_trend(conn, days=days)["points"]
+        if points:
+            by_day = targets_mod.get_targets_range(conn, points[0]["date"], points[-1]["date"])
+        else:
+            by_day = {}
+    computed = trends.compute(points, by_day, metrics=[metric])
+    series = computed["series"][metric]
+
+    coverage = computed["coverage"]
+    subtitle = (f"{coverage['days_complete']} complete / "
+                f"{coverage['days_unlogged']} unlogged of {days}d")
+
+    if chart == "line":
+        out = charts.line_chart(series, metric, subtitle=subtitle)
+    else:
+        out = charts.deviation_bars(series, metric, subtitle=subtitle)
+    out["metric"] = metric
+    out["coverage"] = coverage
+    return out
 
 
 # --- body composition --------------------------------------------------------------
@@ -360,12 +453,15 @@ def log_body_comp(
     date: str | None = None,
     push_to_garmin: bool = False,
 ) -> dict:
-    """Log a body-fat percentage reading. macro-mcp is the system of record for
-    this (garmin-mcp declared body composition a non-goal). push_to_garmin is
-    accepted but deliberately not enabled -- tested live in SPEC.md's M4 and found
-    to have no observable effect on Garmin's data. Requesting it returns
-    pushed: false with push_error explaining why, rather than silently no-op'ing
-    or claiming a success that wasn't verified.
+    """Log a body-fat percentage reading. Tracking only -- nothing in this
+    server derives from it. `method` should reflect the real source ("scale",
+    "calipers", "dexa", "estimate"); don't default to "scale" if the user
+    didn't say how they measured it.
+
+    push_to_garmin is accepted but deliberately not enabled -- it was tested
+    live and found to have no observable effect on Garmin's data. Requesting it
+    returns pushed: false with push_error explaining why, rather than claiming
+    an unverified success.
     """
     with _db() as conn:
         return body.log_body_comp(conn, percent_fat, method, date, push_to_garmin)
@@ -378,101 +474,63 @@ def get_body_comp(days: int = 90) -> dict:
         return body.get_body_comp(conn, days)
 
 
-# --- targets and goals ---------------------------------------------------------------
+# --- progress photos ---------------------------------------------------------------
 
 
 @mcp.tool
-async def get_targets(date: str | None = None) -> dict:
-    """Resolved macro targets for a day: weekly energy budget (from TDEE and the
-    active goal's rate) distributed across the week by day type -- protein and
-    fat flat every day, carbs carrying the week's day-to-day variance. Null
-    with a reason if there's no active goal or TDEE/weight data isn't
-    available yet -- never a guessed number. See get_day for the composite
-    view (targets + what's actually been eaten + what's left).
-    """
-    exp = await _current_expenditure()
-    with _db() as conn:
-        return goals.get_targets(conn, date, tdee=exp.tdee, trend_weight_lb=exp.trend_weight_lb)
-
-
-@mcp.tool
-async def set_goal(
-    mode: str,
-    rate_lb_per_week: float,
-    protein_g_per_lb: float,
-    fat_g_per_lb_floor: float,
-    stop_metric: str,
-    stop_value: str | None = None,
-    successor_goal_id: int | None = None,
+def log_body_photo(
+    image_base64: str,
+    angle: str = "front",
+    date: str | None = None,
+    note: str | None = None,
 ) -> dict:
-    """Start a new goal (cut/bulk/maintain), superseding whatever goal is
-    currently active. protein_g_per_lb and fat_g_per_lb_floor are yours to
-    set -- this server deliberately has no built-in nutritional stance on
-    what ratio is right for a given goal or person; that judgment belongs in
-    the conversation, not hardcoded here. rate_lb_per_week uses the same
-    sign convention as get_expenditure's trend_lb_per_week: negative = losing.
-    stop_metric "weight"/"bodyfat" need stop_value as that target number (as
-    a string); "date" needs an ISO date; "none" needs no stop_value at all.
-    Snapshots current weight/body-fat as the goal's baseline for later
-    progress tracking (see get_goal) -- if TDEE/weight data isn't available
-    right now, the snapshot and weekly_budget will be null, but the goal is
-    still created; set it again later once data exists, or the baseline just
-    stays unknown for this goal.
+    """Store a progress photo. `image_base64` is the raw image bytes (any common format --
+    JPEG, PNG, HEIC, etc.), base64-encoded with no "data:" URI prefix. `angle` is
+    "front", "side", or "back" -- one photo per date+angle, a later save for the same pair
+    replaces it. Defaults to today.
+
+    The server tries to detect a pose (shoulders, hips) so the dashboard can align this
+    photo with the rest of the series; `align_status` in the response says whether that
+    worked, and `align_reason` explains why not when it didn't (no clear full-body pose,
+    or pose detection unavailable on this host). Either way the photo is still stored and
+    still viewable -- alignment only affects whether the dashboard slideshow can line it up
+    frame to frame, it's never a condition for saving. There's no MCP tool to read the
+    image back into chat; view photos at the /dashboard page instead.
     """
-    exp = await _current_expenditure()
+    try:
+        raw = base64.b64decode(image_base64, validate=True)
+    except Exception as exc:
+        raise ValueError(f"image_base64 is not valid base64: {exc}") from exc
     with _db() as conn:
-        current_percent_fat = _latest_percent_fat(conn)
-        return goals.set_goal(
-            conn, mode, rate_lb_per_week, protein_g_per_lb, fat_g_per_lb_floor,
-            stop_metric, stop_value,
-            current_weight_lb=exp.trend_weight_lb, current_percent_fat=current_percent_fat,
-            tdee=exp.tdee, successor_goal_id=successor_goal_id,
-        )
+        return body_photos.save_photo(conn, raw, angle=angle, day=date, note=note)
 
 
 @mcp.tool
-async def get_goal() -> dict:
-    """The current active goal, with progress toward its stop condition and a
-    projected completion date extrapolated from the current trend rate.
-    {"active": false} if no goal is set. stop_condition_met is reported
-    honestly as a computed fact but does NOT automatically end or transition
-    the goal -- that's a deliberate interim gap (SPEC.md M5.5): goal
-    transitions are meant to be a Claude-mediated proposal once the nightly
-    proposal system (M7) exists, not a silent automatic status change.
+def get_body_photo(date: str | None = None, angle: str = "front") -> dict:
+    """Metadata for a stored progress photo -- dimensions, alignment status, note. Not
+    the image itself (see log_body_photo's note on viewing via /dashboard). Defaults to
+    today. Returns `photo: null` with a reason if nothing is stored for that date+angle.
     """
-    exp = await _current_expenditure()
     with _db() as conn:
-        current_percent_fat = _latest_percent_fat(conn)
-        return goals.get_goal(
-            conn, current_weight_lb=exp.trend_weight_lb,
-            current_percent_fat=current_percent_fat, trend_lb_per_week=exp.trend_lb_per_week,
-        )
+        return body_photos.get_photo(conn, date, angle)
 
 
 @mcp.tool
-def set_training_plan(weekday_map: dict[str, str]) -> dict:
-    """Set the recurring weekly training pattern used to assign a day_type to
-    each date when there's no more specific override. Keys are weekday
-    numbers as strings, "0"=Monday through "6"=Sunday (matching Python's
-    date.weekday()), values are day_type names (e.g. "rest", "moderate",
-    "heavy"). Only the weekdays you pass are changed; others keep their
-    existing assignment.
+def list_body_photos(angle: str = "front", start: str | None = None, end: str | None = None) -> dict:
+    """Which dates have a stored photo for a given angle, in a date range (defaults to
+    the trailing 90 days). Metadata only, same as get_body_photo.
     """
     with _db() as conn:
-        return goals.set_training_plan(conn, {int(k): v for k, v in weekday_map.items()})
+        return body_photos.list_photos(conn, angle, start, end)
 
 
 @mcp.tool
-def set_day_plan(date: str, day_type: str | None = None, macros: dict | None = None) -> dict:
-    """Override a specific date's day type or give it fully explicit macros,
-    beating whatever set_training_plan's recurring pattern would otherwise
-    assign. Pass exactly one of day_type or macros. Explicit macros are
-    logged as-is for that day and excluded from the week's day-type-weighted
-    carb distribution (they still count toward the week's total budget --
-    see get_targets' week_budget_delta).
+def delete_body_photo(date: str, angle: str = "front") -> dict:
+    """Remove a stored photo (and its file on disk). `existed` says whether there was
+    one to remove.
     """
     with _db() as conn:
-        return goals.set_day_plan(conn, date, day_type=day_type, macros=macros)
+        return body_photos.delete_photo(conn, date, angle)
 
 
 if __name__ == "__main__":

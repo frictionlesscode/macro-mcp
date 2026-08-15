@@ -131,9 +131,26 @@ tunnel to match.
 `GARMIN_MCP_URL` needs `host.docker.internal`, not `127.0.0.1`, when this server is running
 in Docker — see the comment in `.env.example` for why. `compose.yml` already adds the
 `extra_hosts` mapping this needs on Linux; Docker Desktop (Windows/Mac) provides it natively.
-Getting this wrong doesn't corrupt anything — `get_expenditure` just reports `tdee: null`
-with a connection-error reason instead of a number, per its degrade-honestly design — but
-it's worth getting right so real weight data actually flows through.
+Getting this wrong doesn't corrupt anything — `/dashboard`'s weight panel just reports the
+trend unavailable with a connection-error reason instead of a chart, per `garmin_weight.py`'s
+degrade-honestly design — but it's worth getting right so real weight data actually shows up.
+(This is the *only* thing macro-mcp reads from garmin-mcp; see SPEC.md's "Progress photos and
+dashboard" for why that narrow read exists after the general bridge was removed.)
+
+## Fetching the pose-landmark model (non-Docker runs)
+
+The Docker image fetches this automatically at build time (see `Dockerfile`). Running the
+server bare (`python -m macro_mcp.server`, e.g. for local dev) needs the same file at
+`./models/pose_landmarker_lite.task`, or `log_body_photo` will store photos unaligned:
+
+```bash
+mkdir -p models
+curl -fsSL -o models/pose_landmarker_lite.task \
+  https://storage.googleapis.com/mediapipe-models/pose_landmarker/pose_landmarker_lite/float16/latest/pose_landmarker_lite.task
+```
+
+Not fetching it isn't a failure mode worth avoiding at all costs — `body_photos.py` degrades to
+storing photos unaligned with a stated reason rather than refusing to run.
 
 ## Surviving a reboot
 
@@ -178,3 +195,9 @@ concrete: **photograph a meal through Claude and confirm it lands in the databas
 macros and a stated confidence.** Once the connector's added (Claude → Settings → Connectors →
 Add custom connector → `<MCP_PUBLIC_URL>/mcp`, sign in with your `MCP_BEARER_TOKEN`), try it
 and see what comes back.
+
+Separately, confirm the dashboard: visit `<MCP_PUBLIC_URL>/dashboard?token=<DASHBOARD_TOKEN>`
+in a browser. It shares the same host/port/Funnel path as `/mcp`, so no extra tunnel
+configuration is needed — if `/mcp` is reachable, `/dashboard` is too. A request with no token,
+or the wrong one, should 401; with the right token it should render even with zero photos
+logged yet (the charts and slideshow just report "no data in this window" honestly).

@@ -22,6 +22,7 @@ import _bootstrap  # noqa: F401
 import asyncio
 import base64
 import hashlib
+import io
 import os
 import secrets
 import socket
@@ -34,15 +35,16 @@ from urllib.parse import parse_qs, urlparse
 
 import httpx
 from fastmcp import Client
+from PIL import Image
 
 REPO_ROOT = Path(__file__).resolve().parent.parent
 
-_REDIRECT_URI = "http://127.0.0.1:0/callback"  # never dialed -- see garmin_client.py's _login
+_REDIRECT_URI = "http://127.0.0.1:0/callback"  # never dialed -- see oauth.py's login form
 
 
 async def headless_login(base_url: str, bearer_token: str) -> str:
-    """The same headless OAuth completion garmin_client.py uses against garmin-mcp, run here
-    against macro-mcp's own identical SingleUserOAuthProvider. Returns an access token.
+    """Complete the same OAuth 2.1 + DCR flow a real Claude connector does, headlessly,
+    against macro-mcp's own SingleUserOAuthProvider. Returns an access token.
     """
     async with httpx.AsyncClient(base_url=base_url, timeout=10.0) as http:
         reg = (await http.post("/register", json={
@@ -130,7 +132,7 @@ class Check:
         return not self.failures
 
 
-async def run_checks(base_url: str, bearer_token: str) -> bool:
+async def run_checks(base_url: str, bearer_token: str, dashboard_token: str) -> bool:
     check = Check()
 
     # -- unauthenticated request must be refused, not silently allowed --
@@ -151,9 +153,11 @@ async def run_checks(base_url: str, bearer_token: str) -> bool:
             "log_food", "log_from_library", "edit_entry", "edit_item",
             "delete_entry", "delete_item", "set_day_status",
             "save_food", "save_recipe", "search_library",
-            "get_day", "get_intake_trend", "get_expenditure",
+            "get_day", "get_intake_trend",
             "log_body_comp", "get_body_comp",
-            "get_targets", "set_goal", "get_goal", "set_training_plan", "set_day_plan",
+            "set_targets", "get_targets", "delete_targets",
+            "get_trend", "render_trend",
+            "log_body_photo", "get_body_photo", "list_body_photos", "delete_body_photo",
         }
         check.ok(
             "all expected tools are registered",
@@ -213,7 +217,7 @@ async def run_checks(base_url: str, bearer_token: str) -> bool:
             f"got {day.get('totals')}",
         )
         check.ok(
-            "get_day honestly reports targets as unimplemented, not a placeholder",
+            "get_day reports a specific reason when no target is stored for this date",
             day["targets"] is None and bool(day["targets_null_reason"]),
         )
 
@@ -223,93 +227,89 @@ async def run_checks(base_url: str, bearer_token: str) -> bool:
             any(p["status"] == "unlogged" and p["kcal"] is None for p in trend["points"]),
         )
 
-        # -- expenditure: honest null, not a fabricated number --
-        expenditure = (await client.call_tool("get_expenditure", {"days": 28})).data
+        # -- targets: no target yet for a fresh date --
+        no_target = (await client.call_tool("get_targets", {"date": "2026-09-01"})).data
         check.ok(
-            "get_expenditure returns null with a real reason (no weight source wired up yet)",
-            expenditure["tdee"] is None and bool(expenditure["tdee_null_reason"]),
-            f"got {expenditure}",
+            "get_targets is null with a specific reason before any target is set",
+            no_target["targets"] is None and "no targets set" in (no_target["targets_null_reason"] or ""),
+            f"got {no_target}",
         )
 
-        # -- targets/goals: no goal yet --
-        no_goal_targets = (await client.call_tool("get_targets", {})).data
+        # -- set_targets: bulk, storage only, no derivation of any kind --
+        set_result = (await client.call_tool("set_targets", {"targets": [
+            {"date": "2026-09-01", "protein_g": 190, "carb_g": 60, "fat_g": 32},   # kcal omitted
+            {"date": "2026-09-02", "protein_g": 190, "carb_g": 45, "fat_g": 20},
+            {"date": "2026-09-07", "protein_g": 190, "carb_g": 180, "fat_g": 50, "note": "refeed"},
+        ]})).data
         check.ok(
-            "get_targets is null with 'no active goal' before any goal is set",
-            no_goal_targets["kcal"] is None and "no active goal" in (no_goal_targets["targets_null_reason"] or ""),
-            f"got {no_goal_targets}",
-        )
-        no_goal = (await client.call_tool("get_goal", {})).data
-        check.ok("get_goal reports active: false with no goal set", no_goal == {"active": False})
-
-        # -- set a goal; this server has no live garmin-mcp in this ephemeral test env, so
-        # weekly_budget/implied_rate must come back honestly null rather than guessed --
-        goal = (await client.call_tool("set_goal", {
-            "mode": "cut", "rate_lb_per_week": -1.0,
-            "protein_g_per_lb": 1.0, "fat_g_per_lb_floor": 0.35,
-            "stop_metric": "weight", "stop_value": "180",
-        })).data
-        check.ok(
-            "set_goal creates a goal but honestly nulls weekly_budget without a TDEE",
-            goal["ok"] and goal["weekly_budget"] is None and bool(goal.get("weekly_budget_null_reason")),
-            f"got {goal}",
+            "set_targets stores a batch and derives kcal via Atwater when omitted",
+            set_result["ok"] and set_result["count"] == 3
+            and "2026-09-01" in set_result.get("kcal_derived_for", []),
+            f"got {set_result}",
         )
 
-        active_goal = (await client.call_tool("get_goal", {})).data
+        stored = (await client.call_tool("get_targets", {"date": "2026-09-01"})).data
         check.ok(
-            "get_goal reflects the goal just set",
-            active_goal["active"] and active_goal["mode"] == "cut" and active_goal["stop_value"] == "180",
-            f"got {active_goal}",
+            "get_targets returns exactly what was set, kcal derived not zero",
+            stored["targets"] == {"kcal": 1288, "protein_g": 190, "carb_g": 60,
+                                  "fat_g": 32, "fiber_g": 0},
+            f"got {stored}",
         )
 
-        # -- now that a goal exists, get_targets' null reason should shift from 'no active
-        # goal' to the TDEE problem specifically -- proves the two failure modes are
-        # genuinely distinguished, not the same generic message --
-        targets_now = (await client.call_tool("get_targets", {})).data
+        refeed = (await client.call_tool("get_targets", {"date": "2026-09-07"})).data
+        check.ok("set_targets stores a per-date note", refeed["note"] == "refeed", f"got {refeed}")
+
+        # -- get_day composes stored targets with logged totals --
+        day_1 = (await client.call_tool("get_day", {"date": "2026-09-01"})).data
         check.ok(
-            "get_targets null reason shifts to the TDEE problem once a goal exists",
-            targets_now["kcal"] is None and "TDEE" in (targets_now["targets_null_reason"] or ""),
-            f"got {targets_now}",
+            "get_day reports targets_null_reason: None once a target is stored, "
+            "and remaining equals the full target with nothing logged",
+            day_1["targets_null_reason"] is None
+            and day_1["remaining"] == {"kcal": 1288, "protein_g": 190, "carb_g": 60,
+                                       "fat_g": 32, "fiber_g": 0},
+            f"got {day_1}",
         )
 
-        # -- get_day composes in the same honest null once a goal exists --
-        day_with_goal = (await client.call_tool("get_day", {})).data
-        check.ok(
-            "get_day's targets_null_reason updates once a goal exists",
-            day_with_goal["targets"] is None and "TDEE" in (day_with_goal["targets_null_reason"] or ""),
-            f"got targets_null_reason={day_with_goal.get('targets_null_reason')}",
-        )
+        deleted = (await client.call_tool("delete_targets", {"date": "2026-09-02"})).data
+        check.ok("delete_targets removes a stored target", deleted["ok"] and deleted["existed"])
+        gone = (await client.call_tool("get_targets", {"date": "2026-09-02"})).data
+        check.ok("deleted target reads back as null", gone["targets"] is None)
 
-        # -- training plan and day plan persist correctly even though resolution is blocked --
-        plan = (await client.call_tool("set_training_plan", {"weekday_map": {"0": "heavy", "6": "rest"}})).data
-        # dict keys are always strings over JSON-RPC, regardless of the int keys
-        # goals.set_training_plan uses internally (tests/test_goals.py checks those directly).
-        check.ok("set_training_plan updates the requested weekdays",
-                 plan["ok"] and plan["updated"] == {"0": "heavy", "6": "rest"}, f"got {plan}")
-
-        day_type_override = (await client.call_tool(
-            "set_day_plan", {"date": "2026-09-01", "day_type": "rest"},
-        )).data
-        check.ok("set_day_plan accepts a day_type override",
-                 day_type_override["ok"] and day_type_override["day_type"] == "rest")
-
-        macro_override = (await client.call_tool(
-            "set_day_plan",
-            {"date": "2026-09-02",
-             "macros": {"kcal": 1900, "protein_g": 160, "carb_g": 180, "fat_g": 55}},
-        )).data
-        check.ok(
-            "set_day_plan accepts and normalizes an explicit macro override",
-            macro_override["ok"] and macro_override["explicit_macros"]["fiber_g"] == 0.0,
-            f"got {macro_override}",
-        )
-
-        bad_goal = await client.call_tool(
-            "set_goal",
-            {"mode": "shred", "rate_lb_per_week": -1.0, "protein_g_per_lb": 1.0,
-             "fat_g_per_lb_floor": 0.35, "stop_metric": "none"},
+        bad_target = await client.call_tool(
+            "set_targets", {"targets": [{"date": "2026-09-01", "protein_g": -5,
+                                        "carb_g": 60, "fat_g": 32}]},
             raise_on_error=False,
         )
-        check.ok("an invalid goal mode surfaces as a tool error", bad_goal.is_error)
+        check.ok("a negative macro value surfaces as a tool error", bad_target.is_error)
+
+        # -- trends: adherence against real logged data and stored targets --
+        trend_full = (await client.call_tool("get_trend", {"days": 10})).data
+        check.ok(
+            "get_trend returns per-metric series with coverage always present",
+            "kcal" in trend_full["series"] and trend_full["coverage"]["days_requested"] == 10,
+            f"got coverage={trend_full.get('coverage')}",
+        )
+        check.ok(
+            "get_trend suppresses averages/adherence on a sparse window rather than guessing",
+            trend_full["averages"] is None and bool(trend_full["suppressed_reason"]),
+            f"got {trend_full.get('suppressed_reason')}",
+        )
+
+        # -- charts: SVG returned, or a stated reason instead of an empty/broken image --
+        chart = (await client.call_tool("render_trend", {"days": 10, "metric": "kcal"})).data
+        chart_ok = (chart["svg"] is not None and chart["svg"].startswith("<svg")) or (
+            chart["svg"] is None and bool(chart.get("svg_null_reason"))
+        )
+        check.ok(
+            "render_trend returns a real SVG or an honest reason, never an empty image",
+            chart_ok, f"got svg_null_reason={chart.get('svg_null_reason')}",
+        )
+
+        bad_chart = await client.call_tool(
+            "render_trend", {"days": 10, "metric": "kcal", "chart": "pie"},
+            raise_on_error=False,
+        )
+        check.ok("an invalid chart type surfaces as a tool error", bad_chart.is_error)
 
         # -- edits and deletes actually change stored state --
         # meal["entries"] is the whole day, chronologically -- breakfast (07:30) sorts
@@ -351,6 +351,50 @@ async def run_checks(base_url: str, bearer_token: str) -> bool:
             f"got {comp_trend}",
         )
 
+        # -- progress photos: stored, listed, aligned-or-honestly-not, deleted --
+        buf = io.BytesIO()
+        Image.new("RGB", (120, 240), (90, 90, 90)).save(buf, "PNG")
+        image_b64 = base64.b64encode(buf.getvalue()).decode()
+
+        photo = (await client.call_tool(
+            "log_body_photo", {"image_base64": image_b64, "angle": "front", "date": "2026-09-01"},
+        )).data
+        check.ok(
+            "log_body_photo stores the photo and reports an alignment status either way",
+            photo["ok"] and photo["align_status"] in ("ok", "failed"),
+            f"got {photo}",
+        )
+
+        got_photo = (await client.call_tool("get_body_photo", {"date": "2026-09-01"})).data
+        check.ok(
+            "get_body_photo returns metadata for what was just stored",
+            got_photo["photo"] is not None and got_photo["photo"]["angle"] == "front",
+            f"got {got_photo}",
+        )
+
+        listing = (await client.call_tool(
+            "list_body_photos", {"angle": "front", "start": "2026-09-01", "end": "2026-09-01"},
+        )).data
+        check.ok(
+            "list_body_photos finds the photo just stored",
+            listing["photos"] and listing["photos"][0]["day"] == "2026-09-01",
+            f"got {listing}",
+        )
+
+        photo_deleted = (await client.call_tool("delete_body_photo", {"date": "2026-09-01"})).data
+        check.ok("delete_body_photo removes it", photo_deleted["ok"] and photo_deleted["existed"])
+
+        bad_angle = await client.call_tool(
+            "log_body_photo", {"image_base64": image_b64, "angle": "overhead"},
+            raise_on_error=False,
+        )
+        check.ok("an invalid photo angle surfaces as a tool error", bad_angle.is_error)
+
+        # re-store one for the dashboard checks below
+        await client.call_tool(
+            "log_body_photo", {"image_base64": image_b64, "angle": "front", "date": "2026-09-01"},
+        )
+
         # -- validation errors surface as real tool errors, not silent failures --
         bad = await client.call_tool(
             "log_food",
@@ -359,6 +403,40 @@ async def run_checks(base_url: str, bearer_token: str) -> bool:
             raise_on_error=False,
         )
         check.ok("an invalid meal type surfaces as a tool error, not a silent 200", bad.is_error)
+
+    # -- dashboard: token-gated HTML page and the image endpoint it references --
+    async with httpx.AsyncClient(base_url=base_url, timeout=10.0) as http:
+        unauth = await http.get("/dashboard", params={"angle": "front"})
+        check.ok(
+            "the dashboard refuses a request with no token",
+            unauth.status_code == 401, f"got {unauth.status_code}",
+        )
+
+        page = await http.get("/dashboard", params={"angle": "front", "token": dashboard_token})
+        check.ok(
+            "the dashboard page renders for a valid token",
+            page.status_code == 200 and "Body dashboard" in page.text,
+            f"got {page.status_code}",
+        )
+
+        img = await http.get(
+            "/dashboard/photo",
+            params={"day": "2026-09-01", "angle": "front", "token": dashboard_token},
+        )
+        check.ok(
+            "the dashboard photo endpoint returns a real JPEG for a stored photo",
+            img.status_code == 200 and img.content[:2] == b"\xff\xd8",
+            f"got {img.status_code}",
+        )
+
+        missing = await http.get(
+            "/dashboard/photo",
+            params={"day": "2099-01-01", "angle": "front", "token": dashboard_token},
+        )
+        check.ok(
+            "the dashboard photo endpoint 404s for a photo that doesn't exist, not a 500",
+            missing.status_code == 404, f"got {missing.status_code}",
+        )
 
     return check.summary()
 
@@ -375,21 +453,16 @@ def main() -> int:
     proc = None
     bearer_token = secrets.token_urlsafe(32)
     try:
+        dashboard_token = secrets.token_urlsafe(16)
         env = os.environ.copy()
         env["SQLITE_PATH"] = str(tmp / "smoke.db")
+        env["PHOTO_DIR"] = str(tmp / "photos")
         env["MCP_PORT"] = str(port)
         env["MCP_HOST"] = "127.0.0.1"
         env["MCP_BEARER_TOKEN"] = bearer_token
+        env["DASHBOARD_TOKEN"] = dashboard_token
         env["MCP_PUBLIC_URL"] = base_url
         env["OAUTH_STATE_PATH"] = str(tmp / "oauth_state.json")
-        # This server-under-test's own garmin-mcp bridge is irrelevant to what this script
-        # verifies (it's exercised for real in tests/test_garmin_client.py's integration
-        # test); pointing it at an unreachable port keeps this run fast and self-contained
-        # rather than depending on a real garmin-mcp instance being up. Using a freshly
-        # freed high port rather than a reserved one like 1 -- Windows doesn't fast-refuse
-        # connections to reserved/privileged ports the way it does an ordinary closed one,
-        # which was slow enough to make /health itself time out during startup polling.
-        env.setdefault("GARMIN_MCP_URL", f"http://127.0.0.1:{free_port()}/mcp")
         env["PYTHONPATH"] = str(REPO_ROOT / "src")
 
         # Redirected to a file, not subprocess.PIPE: a pipe nobody drains can fill its OS
@@ -405,7 +478,7 @@ def main() -> int:
             try:
                 wait_for_health(base_url, proc)
                 print(f"server healthy at {base_url}\n")
-                ok = asyncio.run(run_checks(base_url, bearer_token))
+                ok = asyncio.run(run_checks(base_url, bearer_token, dashboard_token))
             except Exception:
                 proc.poll()
                 print("--- server log ---")

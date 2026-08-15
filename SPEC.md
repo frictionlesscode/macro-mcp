@@ -1,533 +1,313 @@
 # macro-mcp — Build Spec
 
-A remote MCP server for nutrition logging and adaptive expenditure estimation, designed to run
-alongside [garmin-mcp](https://github.com/frictionlesscode/garmin-mcp) and be driven from Claude on mobile.
+A self-hosted MCP server that tracks what you eat against macro targets, and reports how it's
+going. Driven from Claude, including on mobile.
 
 ---
 
-## Objective
+## Charter
 
-Claude acts as a nutrition coach. This server is the data plane **plus the deterministic math**:
-food logs, adaptive TDEE estimation, and macro target resolution. Coaching judgment — what your
-goals mean, how to interpret a stall, what to eat — lives in a separate `macro-coach` Skill.
+**macro-mcp owns:**
 
-Body weight, body-fat pushes, activity, sleep, and training load all come from `garmin-mcp`. This
-server does not hold Garmin credentials and does not talk to Garmin directly.
+- **Stored macro targets** — whatever Claude sets, per date. Storage only.
+- **Food logging** — by description or photo, with per-item provenance and confidence.
+- **Food lookup** — the personal library and (later) barcode/branded search, in service of
+  logging.
+- **Intake vs. target calculation** — totals, remaining, over/under.
+- **Trend computation** — rolling averages, adherence, variance, patterns over time.
+- **Charting** — server-rendered SVG, so charts are consistent and identical everywhere.
+- **Progress photos** — stored on disk, pose-aligned when possible, viewable through a
+  token-gated `/dashboard` page alongside weight and body-fat % trend. Added 2026-08-15; see
+  "Progress photos and dashboard" below.
 
-## Division of labor
+**macro-mcp explicitly does not own:**
 
-The governing principle, which every design decision below follows:
+- **TDEE / energy expenditure.** Comes from Garmin activity data, the user's own history, and
+  Claude's memory of the conversation.
+- **Goals.** The user states a goal in conversation; Claude holds it.
+- **Plans, programmes, or cadence.** Which day is a training day, when a refeed lands, when a
+  cut ends — all Claude's.
+- **Any derivation of what the user *should* eat.** The server never computes a target. It
+  stores the number it was given and reports what happened against it.
+- **Weight as system of record.** garmin-mcp still owns it (see "Locked decisions"). The
+  dashboard *reads* a trend from garmin-mcp purely for display — see "Progress photos and
+  dashboard" for why that one narrow read doesn't reopen the M4 bridge this charter removed.
 
-> **Claude decides and writes. The server computes and detects. The server never silently reallocates.**
+The dividing line: **the server records and measures; Claude decides.** If a capability
+requires an opinion about nutrition or training, it does not belong here.
 
-| Owner | Responsibility |
-|---|---|
-| Server | Trend weight. Expenditure estimate. Weekly energy budget. Turning a day label into grams. Detecting that a week doesn't sum, that a planned session didn't happen, or that a goal's stop condition has tripped. |
-| Skill (Claude) | Goal setting and onboarding. Estimating macros from text and photos. Which days are heavy/moderate/rest. How to redistribute a skipped day. Whether to accept a proposal. All interpretation. |
+### Charter change (2026-08-14) — what this replaced, and why
 
-## Locked decisions — do not re-litigate
+An earlier version of this spec had the server derive targets: `set_goal` took a rate and
+per-pound protein/fat ratios, an expenditure engine estimated TDEE from energy balance, and a
+resolver distributed a weekly calorie budget across day types using relative `carb_weight`
+values. It was built, tested, and worked.
+
+It was removed because it violated this project's own stated principle (*"Claude decides and
+writes. The server computes and detects."*). Computing a weekly budget from a goal rate and
+turning it into a day's carbohydrate number looks like arithmetic, but it is a nutritional
+decision wearing arithmetic's clothes — and it made the server the owner of a decision the
+user and Claude were better placed to make.
+
+The concrete failure that surfaced it: a fat-cycling protocol (training / PSMF / refeed days
+with fat at 32 / 20 / 50 g) **could not be expressed at all**, because the engine held fat
+flat by construction and let only carbs vary. The first proposed fix was to add a
+per-day-type fat map — which would have layered a second mechanism on top of the first while
+leaving the underlying problem (the server holding a philosophy) untouched.
+
+Deleted outright: `expenditure.py`, the old `targets.py` resolver, `goals.py`,
+`garmin_client.py`, `scripts/simulate.py`, and the `goal` / `day_type` / `training_plan` /
+`day_plan` / `proposal` tables. Not deprecated — removed. Their design notes survive only in
+this section and in git history.
+
+### Progress photos and dashboard (2026-08-15)
+
+Added after the charter change above, not part of it — a distinct capability, not a walk-back.
+The user wants a visual time series of their own body (photos aligned frame to frame, next to
+weight and body-fat % trend) the same way `get_trend`/`render_trend` already give a visual
+time series of macro adherence. Three decisions were made explicitly rather than defaulted:
+
+- **Storage lives here, not a separate service.** macro-mcp already owns `body_comp`; a photo
+  is another body-tracking data type, and a second self-hosted service would mean a second
+  thing to deploy, secure, and keep alive for one feature.
+- **Alignment is automatic (pose landmarks), not manual tap-points.** `body_photos.py` detects
+  shoulder/hip midpoints via MediaPipe and rotates/scales/translates each photo onto a shared
+  canvas. This is a real ML dependency (`pyproject.toml`'s `photos` extra, ~200MB+, no
+  guaranteed wheel on every architecture) — its absence, or a failed detection on one photo,
+  degrades to storing that photo unaligned and flagged with a reason. It never blocks the
+  save and never refuses to run the server. mediapipe's classic bundled-weights Pose API
+  (no model download needed) was removed as of mediapipe 1.x — confirmed against the real
+  installed package, not assumed from old docs — so this uses the newer Tasks API, which
+  needs a model file (`POSE_MODEL_PATH`) fetched once at Docker build time so the running
+  container needs no outbound internet access for it.
+- **The dashboard reads weight from garmin-mcp, narrowly.** Weight is a locked non-goal here
+  (garmin-mcp owns it). Rather than skip weight or duplicate it into macro-mcp's own storage,
+  `garmin_weight.py` restores the exact, already-verified-live OAuth client the M4 bridge
+  used — narrowed to the one read the dashboard needs (`get_body_trend`), never a write, and
+  nothing downstream derives a target or plan from it. It exists only because the dashboard's
+  weight panel would otherwise be permanently null; it is not a reopening of the general
+  garmin-mcp bridge the charter change removed. No macro/target/trend logic calls it —
+  `dashboard.py` is its only caller.
+
+The dashboard itself is a second, deliberately separate secret (`DASHBOARD_TOKEN`, distinct
+from `MCP_BEARER_TOKEN`) gating a plain HTTP page — see "Locked decisions" and Config. It is
+reachable over the same Tailscale Funnel as the MCP endpoint, which is genuinely more exposed
+than a photo of your own body ought to be; the separate token means a leaked dashboard link
+(pasted into a chat, sitting in browser history) is not also a working MCP credential, and an
+unset token disables the dashboard rather than defaulting it open.
+
+---
+
+## Locked decisions
 
 | Decision | Choice |
 |---|---|
 | Language | Python 3.11+ |
-| MCP framework | FastMCP, **Streamable HTTP transport** |
+| MCP framework | FastMCP, Streamable HTTP transport |
 | Local store | SQLite |
-| Packaging | Docker, bound to `127.0.0.1:18081` only (18080 is garmin-mcp) |
-| Public exposure | Existing reverse tunnel, configured outside this repo |
-| Auth | OAuth 2.1 + Dynamic Client Registration, **copied** from garmin-mcp (not shared, not gateway) |
-| Host | Owner's always-on PC |
-| Body/activity source | `garmin-mcp`, called server-to-server as an MCP client |
-| Expenditure math | Deterministic, in-server, unit-tested |
-| Coaching logic | `macro-coach` Skill, not here |
-| Charts | Skill-owned pinned HTML template; Claude injects the series the server returns |
-| Tracked nutrients | kcal, protein, carbohydrate, fat, **fiber** |
-| Food photos | Read by Claude in-chat, **never stored** |
-| Food data | Personal library, plus Open Food Facts for barcodes and branded items |
-| Target shape | Weekly energy budget, distributed to per-day targets by Claude-assigned day type |
-| Guardrails | **None blocking.** Implied rate of change is always reported alongside any target written. |
-| Scheduling | Nightly recompute + staged weekly proposal. No unsolicited messages. |
+| Packaging | Docker, bound to `127.0.0.1:18081` only |
+| Public exposure | Tailscale Funnel on port 443 (see `docs/self-hosted-setup.md`) |
+| Auth | OAuth 2.1 + Dynamic Client Registration, copied from garmin-mcp |
+| Targets | **Stored, never derived.** Claude sets them; the server keeps them. |
+| Tracked nutrients | kcal, protein, carbohydrate, fat, fiber |
+| Food photos | Read by Claude in-chat, never stored |
+| Progress photos | **Stored** on disk (`PHOTO_DIR`), pose-aligned when possible — see "Progress photos and dashboard" |
+| Weight (dashboard only) | Read-only, live, from garmin-mcp — never stored here, never a system of record |
+| Charts | **Server-rendered inline SVG**, no external libraries |
+| Dashboard | Token-gated HTML page (`DASHBOARD_TOKEN`, separate from `MCP_BEARER_TOKEN`), same Funnel as MCP |
+| Guardrails | None blocking. The server reports; it does not refuse or clamp. |
 | Multi-user | No. Single user, single account. |
-| Audience | Publishable open source, same treatment garmin-mcp got |
+| Audience | Publishable open source |
 
 ## Non-goals
 
-- **No coaching thresholds, philosophy, or programming rules in the server.** Those live in the Skill.
-- **No body weight as system of record.** garmin-mcp owns weight. This server reads it.
-- **No image storage.** No plate photos, no label photos.
-- **No REST API in v1.** MCP only. Revisit when something concrete needs it.
-- **No web UI in v1.** Optional late milestone if browsing turns out to beat asking.
-- **No alcohol column.** Owner does not drink. Schema leaves room; adding it is a one-line migration.
-- **No micronutrients beyond fiber.** No sodium, sugar, or saturated fat in v1.
-- **No blocking safety limits.** Explicitly declined by the owner.
+- No TDEE estimation, goal tracking, or target derivation (see Charter).
+- No coaching thresholds or nutritional opinions of any kind.
+- No body weight as system of record — garmin-mcp owns it; the dashboard only reads a trend
+  for display (see "Progress photos and dashboard").
+- No storage of *food* photos — those are still read in-chat only and never saved. Progress
+  photos are a separate, deliberately different capability; see above.
+- No REST API beyond the dashboard's own read-only HTML/image routes. Every write is MCP only.
+- No alcohol column; no micronutrients beyond fiber.
 
 ---
 
 ## Critical instructions
 
-**Verify library APIs against the installed package, not from memory.** This has already bitten
-once during planning: GarminDB's `weight` table turned out to hold only `(day, weight)` — no body
-composition at all — invalidating an assumption that body-fat data was already available locally.
-Inspect the installed package before writing any call.
+**Never return a fabricated or interpolated value.** Every tool that cannot answer returns
+`null` plus a `*_reason` explaining why. This applies to trend statistics as much as anything
+else: a rolling average over three days of a twenty-eight-day window is not an average, it is
+a guess with error bars nobody asked for. Suppress and say so.
 
-**Never return a fabricated or interpolated value.** This rule is inherited from garmin-mcp and
-matters more here, because a plausible-but-wrong expenditure estimate silently sets wrong macros
-for weeks. Every tool that cannot answer returns `null` plus a `*_reason` field explaining why.
-An LLM asked for a TDEE will always produce a confident number; the server's job is to refuse when
-the data doesn't support one.
+**A day with no logged food is unknown, not zero.** Unlogged days never count as zero-intake
+days in any average, adherence rate, or chart. They render as gaps, not as points at zero.
 
-**A day with no logged food is unknown, not zero.** Treating an unlogged day as a low-intake day
-makes every forgotten dinner read as a deficit and drags the expenditure estimate down. Unlogged
-and partially-logged days are excluded from the fit and flagged.
+**A `null` describes a data state, not a missing feature.** Phrase every reason in terms of
+what data is absent or what the user hasn't set yet — never in terms of build state. A message
+reading "not implemented until M3" survived past the milestone that implemented it and was
+read, reasonably, as proof the feature didn't exist.
 
-**Build to the milestone gates below. Stop at each gate and report.** M1 and M2 carry all the real
-risk — M1 because estimation accuracy is the foundation everything else rests on, M2 because the
-smoothing constant is the highest-stakes parameter in the system. Do not build past them unverified.
+**Targets are specifications; logged food is testimony.** A target's `kcal` may be derived
+from its macros via Atwater when not supplied — 190P/60C/32F has exactly one energy content.
+A logged food's stated calories are never rewritten, only flagged when they disagree with
+their macros. These rules are deliberately opposite.
 
-**Never commit secrets.** `.env`, the SQLite file, and the garmin-mcp access token are gitignored.
-
----
-
-## Known properties worth understanding before building
-
-**Under-logging is self-correcting, until it isn't.** If the owner consistently under-reports by
-15%, the expenditure estimate comes out 15% low — and the target derived from it is correspondingly
-low, so the goal rate is still achieved. The absolute number is wrong but the system works. This
-breaks when logging *bias changes* (getting stricter or lazier), which the algorithm reads as a
-metabolic shift. The Skill should watch adherence *quality*, not just adherence.
-
-**The trend signal is noisy relative to the effect being measured.** A realistic weigh-in series can move ~6 lb across three consecutive days on water shifts alone. Meanwhile the actual weekly signal being extracted is on the order of 1–2 lb. Smoothing is
-not a nicety here; a naive linear fit over a short window is dominated by whichever day happened to
-be a water spike.
-
-**Energy density is a tunable constant, not 3500.** The 3500 kcal/lb figure assumes fat. An owner
-doing progressive strength work while cutting is changing body composition, not just fat mass, so
-the true conversion drifts. Make it configuration, and let the engine be calibrated against
-observed data rather than asserting the textbook number.
+**Never commit secrets.** `.env`, the SQLite file, and any token are gitignored.
 
 ---
 
 ## Data model
 
 ```
-food_entry      id, logged_at (tz-aware), day (date), meal, description,
-                kcal, protein_g, carb_g, fat_g, fiber_g,
-                source (label|barcode|library|estimate), confidence, library_food_id?, planned (bool)
+food_entry    id, group_id, logged_at (tz-aware), day, meal, description, name, qty, unit,
+              kcal, protein_g, carb_g, fat_g, fiber_g,
+              source (label|barcode|library|estimate), confidence, library_food_id?, planned
 
-day_log         day (PK), status (complete|partial|unlogged), notes
-                -- status drives inclusion in the expenditure fit
+day_log       day (PK), status (complete|partial|unlogged), notes
+              -- 'complete' is the user's assertion, never inferred from entry count
 
-library_food    id, name, brand?, barcode?, serving_desc, serving_g,
-                kcal, protein_g, carb_g, fat_g, fiber_g, source, times_used, last_used
+day_target    day (PK), kcal, protein_g, carb_g, fat_g, fiber_g, note, set_at
+              -- exactly what Claude set for that date. No day types, no weights, no
+              -- recurrence, no derivation. Claude owns the cadence and writes each date.
 
-recipe          id, name, servings, ingredients[] -> library_food + qty
+library_food  id, name, brand?, barcode?, serving_desc, serving_g,
+              kcal, protein_g, carb_g, fat_g, fiber_g, source, times_used, last_used
 
-body_comp       day (PK), percent_fat, method (scale|calipers|dexa|estimate),
-                pushed_to_garmin (bool), push_error?
-                -- system of record. Weight is NOT stored here; garmin-mcp owns it.
+recipe        id, name, servings  +  recipe_ingredient -> library_food + qty
 
-goal            id, mode (cut|bulk|maintain), rate_lb_per_week,
-                protein_g_per_lb, fat_g_per_lb_floor,
-                stop_metric (weight|bodyfat|date|none), stop_value,
-                start_weight_lb?, start_percent_fat?,
-                successor_goal_id?, status (active|met|superseded|abandoned),
-                started_on, ended_on
-                -- protein_g_per_lb/fat_g_per_lb_floor added when targets.py was built:
-                -- the tool contract sketch below didn't say where these come from, and
-                -- hardcoding a ratio in the server would be exactly the kind of nutritional
-                -- stance SPEC's own non-goals list rules out -- so they're Claude-set,
-                -- required, no server default. start_weight_lb/start_percent_fat are
-                -- snapshotted at set_goal time so get_goal's progress/projected_completion
-                -- have a baseline that survives later garmin-mcp data gaps.
+body_comp     day (PK), percent_fat, method (scale|calipers|dexa|estimate)
+              -- Retained deliberately, though arguably outside the charter: garmin-mcp
+              -- declared body composition a non-goal, so this is the only home for it.
+              -- Tracking-only; nothing derives from it. Drop it if that stops being worth
+              -- the exception.
 
-training_plan   weekday (0-6), day_type       -- recurring pattern, written by Claude
-day_plan        day (PK), day_type, explicit_macros?, source (plan|override|reconciled)
-
-day_type        name (rest|moderate|heavy|...), energy_weight, carb_weight
-                -- seeded at onboarding, tunable
-
-proposal        id, kind (target|transition|reconciliation), created_on, payload,
-                status (pending|accepted|declined), decided_on
+body_photo    day + angle (PK, angle in front|side|back), file_path, width, height,
+              landmarks_json?, align_status (pending|ok|failed), align_reason?, note, created_at
+              -- file_path points at a JPEG under PHOTO_DIR; the image itself is never in the
+              -- DB. landmarks_json caches the pose landmarks detected at save time so the
+              -- dashboard doesn't re-run detection on every render.
 ```
 
-Weight is deliberately absent. Body fat is deliberately present — garmin-mcp declared circumference
-and body composition a non-goal, and goals here can terminate on BF%, so this server owns it.
+`day_target` replaces `day_plan`. It holds the same shape `day_plan`'s `explicit_macros`
+already held — the explicit path was the only part of the old model that survived contact
+with a real protocol, so it became the whole model.
 
 ---
 
-## The expenditure engine
+## Trend computation
 
-Two stages, both deterministic and unit-tested.
+Deterministic statistics over logged intake and stored targets. No opinions, no thresholds,
+no verdicts — the numbers, and enough context to read them honestly.
 
-**Trend weight.** Exponentially-weighted (or Kalman) smoothing of daily weigh-ins pulled from
-garmin-mcp. The smoothing constant is configuration and is the parameter most worth tuning.
+- **Rolling averages** over a window, computed across `complete` days only.
+- **Adherence**: per macro, how often intake landed over, under, or within a tolerance band of
+  target; mean signed deviation (the bias) reported separately from mean absolute deviation
+  (the scatter), because a consistent small overshoot and wild swings averaging to zero are
+  different problems.
+- **Coverage**: how many days in the window were complete / partial / unlogged, always
+  returned alongside any statistic so a figure computed from four days is never mistaken for
+  one computed from twenty-eight.
+- **Suppression**: below a minimum number of usable days, statistics return `null` with a
+  reason rather than a number.
 
-**Expenditure.** Energy balance over a rolling window:
+Adherence is reported both daily and weekly. A single day over target inside an otherwise
+balanced week is not the same signal as a persistent drift, and the tool surfaces both rather
+than picking one.
 
-```
-TDEE ≈ mean_daily_intake + (Δtrend_weight × kcal_per_lb) / days
-```
+## Charting
 
-...restricted to days marked `complete`, with recent data weighted more heavily, and returning a
-confidence derived from data density and residual variance. Below a configured minimum of usable
-days, it returns `null` with a reason — it does not return a low-confidence guess.
+Server-generated inline SVG, built with plain string formatting. **No matplotlib, no charting
+library, no CDN** — Claude's artifact sandbox blocks external scripts, so anything requiring a
+library would have to inline hundreds of kilobytes of it.
 
-Notably, **activity data is not an input.** Expenditure is inferred from energy balance, so
-training is already reflected in the observed weight response. Garmin activity, training load,
-HRV, and sleep are *context for interpretation* — is the deficit hurting recovery, is a stall
-actually water retention from a heavy session — not terms in the equation. Do not add exercise
-calories on top of targets.
+- Line charts for intake vs. target over time; bar charts for per-day deviation.
+- Unlogged days are gaps in the line, never zero-valued points.
+- Target shown as a reference band, so over/under is visible without reading the axis.
+- Native `<title>` elements per point give hover tooltips with no JavaScript.
+- A `<style>` block with `prefers-color-scheme` so charts are legible in light and dark.
+- Output is roughly 10–20 KB — small enough that returning one through a tool call is cheap,
+  unlike a base64 raster image.
 
-## Targets
-
-The weekly energy budget is the anchor, because per-day targets vary:
-
-```
-weekly_budget = 7 × TDEE + (goal_rate_lb_per_week × kcal_per_lb)
-```
-
-`goal_rate_lb_per_week` uses the same sign convention as `get_expenditure`'s
-`trend_lb_per_week` (and garmin-mcp's `get_body_trend`): **negative = losing**. The `+` here is
-not a typo — with that convention, a cut's negative rate has to *lower* the budget, and
-`7×TDEE − (negative × kcal_per_lb)` would raise it instead. This was caught by `targets.py`'s
-own tests during the targets-engine build (M5.5, below), the same class of mistake the
-sign-convention comment in `expenditure.py` was written to prevent.
-
-Claude assigns a `day_type` per date (from `training_plan`, or an explicit override via
-`day_plan`). The server resolves `day_type + weekly_budget → grams`. **The concrete algorithm,
-locked when `targets.py` was built** (the milestone list only stated the principle — protein
-flat, fat floor, carb carries the variance — not a formula; this is that formula, made explicit
-so it's no longer ambiguous):
-
-1. **Total weekly kcal is fixed by TDEE, not by day type.** `day_type.energy_weight` exists in
-   the schema and is **reserved, unused by v1** — cycling total daily calories up on heavy days
-   is a real, defensible practice, but it's a nutritional *stance*, not mechanical plumbing, and
-   the server doesn't take stances (see non-goals). If a future version wants that, it's an
-   explicit, documented addition, not something v1 does silently. `energy_weight` staying in the
-   schema unused, rather than being deleted, is a deliberate choice: it's the extension point for
-   whoever builds that later, not dead weight.
-2. **Protein is flat across the week:** `protein_g = protein_g_per_lb × trend_weight_lb`, using
-   the same `trend_weight_lb` `get_expenditure` already computed (if expenditure is `null`,
-   targets are `null` too, with the same reason — there's no independent weight fetch here, by
-   design, so the two can't disagree).
-3. **Fat is a flat floor:** `fat_g = fat_g_per_lb_floor × trend_weight_lb`, same basis.
-4. **`protein_g_per_lb` and `fat_g_per_lb_floor` are Claude-set, required, no server default.**
-   Any ratio the server picked on its own would be exactly the kind of coaching judgment the
-   non-goals list rules out of this codebase — they're parameters on `set_goal`, chosen the same
-   way Claude would choose them in conversation with the user.
-5. **Carbohydrate absorbs the entire remainder, distributed across the week by
-   `day_type.carb_weight`:**
-   ```
-   protein_fat_weekly_kcal = Σ over 7 days (protein_g×4 + fat_g×9)     [flat, so just ×7]
-   carb_pool_kcal = weekly_budget − protein_fat_weekly_kcal
-   carb_g[day] = max(0, carb_pool_kcal) × (carb_weight[day] / Σ carb_weight over the week) / 4
-   ```
-   This is the "carry the variance" day-to-day differentiation — a heavy day's higher
-   `carb_weight` pulls more of the week's fixed carb pool onto that day, a rest day's lower
-   weight pulls less, while protein and fat stay identical every day.
-6. **Infeasibility is detected, not silently absorbed.** If `carb_pool_kcal < 0` — the flat
-   protein+fat floors alone already exceed the weekly budget — carbs clamp to 0 and the result
-   carries an explicit `infeasible: true` plus the shortfall in kcal. The server does not lower
-   protein or fat to make the week balance; SPEC's own guardrails decision means it doesn't
-   block an aggressive target either. It reports the conflict and leaves the call to Claude.
-7. **Week boundary is Monday-start, ISO (`date.weekday()`, Monday=0..Sunday=6)** — picked
-   because it's the one Python's stdlib gives for free with no reinterpretation, not because it
-   matches any particular convention elsewhere in the stack (`get_zone_summary` in garmin-mcp
-   uses Sunday-start, matching that account's own profile setting — the two aren't meant to
-   agree, they're unrelated boundaries for unrelated purposes).
-
-If the week's seven resolved days don't sum to the budget for any reason other than the
-infeasible case above (there shouldn't be one, given the algorithm above — this is a defensive
-check, not an expected path), the server reports the delta rather than silently rebalancing.
-
-**Adherence is judged weekly, not daily.** The Skill must say so; a "over by 400" day inside a
-balanced week is not a miss.
-
-**Past days freeze when the day closes.** Redistribution only touches remaining days in the current
-week. Otherwise adherence history is unfalsifiable.
-
----
-
-## Milestones
-
-### M1 — Prove estimation, not plumbing
-
-No MCP, no Docker, no auth. SQLite schema, service functions, and a CLI to log meals and dump a day.
-
-The real risk is not the API — it is whether Claude's photo-and-text estimation is good enough to
-build on. So M1 includes a **calibration harness**: ~20 real items whose labels are known, estimated
-from photo alone, error quantified as a distribution. The owner uses a food scale, so portion mass
-is usually known — meaning the harness should measure *identification and composition* error with
-mass given, and separately measure portion error on the unweighted case (restaurant meals) since
-those are the entries that will actually be uncertain in practice.
-
-**Gate:** three real days logged through the CLI. Estimation error reported as a distribution with
-sample size, not a summary adjective. That number determines how hard barcode lookup must work in M6.
-
-### M2 — Expenditure engine, offline
-
-Trend weight, energy-balance expenditure, confidence, and explicit unlogged-day handling.
-
-Testable now without waiting weeks: simulate a subject with a known true TDEE of 2,600 eating 2,100,
-inject realistic water-weight noise (calibrated to plausible ±6 lb day-to-day swings) and missed logging days, and verify recovery of 2,600 within tolerance.
-
-**Gate:** known TDEE recovered from synthetic series within stated tolerance; sparse input returns
-`null` with a reason; the smoothing constant's sensitivity is documented, not just chosen.
-
-### M3 — MCP server, local
-
-FastMCP over Streamable HTTP. Full tool surface below. No auth, no Docker yet.
-
-**Gate:** every tool passes against MCP Inspector.
-
-### M4 — Garmin bridge — done
-
-macro-mcp authenticates to garmin-mcp as an MCP client and pulls trend weight for the
-expenditure engine. Degrades honestly when garmin-mcp is unreachable or login fails —
-`get_expenditure` returns `tdee: null` with the specific reason, never a stale-but-unlabeled
-or fabricated number.
-
-**Auth mechanism, found by reading garmin-mcp's own oauth.py rather than assuming:**
-garmin-mcp requires full OAuth 2.1 + Dynamic Client Registration on every connection — there
-is no static-bearer shortcut, even for a same-host client. `garmin_client.py` completes this
-headlessly: register a client once, submit `GARMIN_MCP_TOKEN` as the same login-form POST a
-human in Claude's connector UI would send, exchange the resulting code for an access/refresh
-token pair, cache it, refresh before expiry. Verified against the live, running garmin-mcp
-instance end to end (register → 201, authorize → 302 with a code, code → token exchange,
-refresh_token grant → new access token, and a live `get_body_trend` call returning real data),
-not written from the OAuth spec alone.
-
-**Both open questions answered empirically, in writing:**
-
-1. **Body-fat push — does not work with the installed `garminconnect==0.3.2`, do not enable it.**
-   `add_body_composition` doesn't call a "set today's body-fat" API field — it synthesizes a
-   FIT file (the binary format a real device produces) with an anonymous, unidentified device
-   and uploads it through Garmin Connect's generic device-data ingestion pipeline, the same one
-   a real scale's sync uses. Tested live against two cases: (a) a date with an existing
-   same-day MANUAL weigh-in already on file, using the *same* weight value to make the test
-   safe regardless of outcome, and (b) a date with zero existing data. Both uploads were
-   accepted at the ingestion layer (`"File processed"`, HTTP 200) but produced **zero
-   observable effect** — no field updated, no duplicate created, confirmed via the live API
-   immediately and a few seconds later. This makes the original duplication question moot:
-   there's nothing to clobber because the write doesn't appear to take effect at all against
-   Garmin's current backend with this library version (a known risk class for this project —
-   see garmin-mcp's own README on the unofficial API changing under it). `log_body_comp`'s
-   `push_to_garmin` stays a documented no-op (`PUSH_NOT_WIRED_REASON` in `body.py`) — not
-   because the wiring is unbuilt, but because building it would mean silently claiming
-   `pushed: true` for a write with no verified effect. Revisit only if a future
-   `garminconnect` version or a different write path changes this.
-2. **Nutrition write-back — does not exist, confirmed by exhaustive package inspection.** The
-   installed `garminconnect` client has zero write methods for nutrition/food/meal data
-   anywhere in its ~134-method public surface (checked every `add_/log_/set_/post_/write_/
-   upload_`-prefixed method, and every method with `nutrition/meal/food/diet/calorie/macro`
-   in its name) — only three read methods
-   (`get_nutrition_daily_food_log`/`_meals`/`_settings`). No live call was needed; the
-   capability simply isn't in the library. Confirms the README's own expectation (Garmin
-   populates that field via MyFitnessPal). **Decision: macro-mcp will not attempt nutrition
-   write-back.** Matches the locked-decisions table's default (macro-mcp owns nutrition), now
-   evidenced rather than assumed.
-
-**Gate:** met. `get_expenditure` verified running on real weight pulled live from garmin-mcp,
-through the actual deployed server (12 real weight points → a real TDEE from real+synthetic
-data; separately verified honest degrade on both garmin-mcp-unreachable and wrong-token cases).
-Both open questions answered in writing above, with live evidence.
-
-### M5 — Auth, Docker, mobile — auth/Docker done; phone gate is the owner's to run
-
-OAuth provider (`oauth.py` + `auth.py`) copied from garmin-mcp -- same DCR/PKCE/login-gate
-mechanism, same persistence-to-`/data` pattern, branding and default `OAUTH_STATE_PATH`
-changed only. Container publishes `127.0.0.1:18081` (chosen not to collide with garmin-mcp's
-`18080`). `/health` (unauthenticated) returns version, DB status, and garmin-mcp reachability.
-
-**All verified live, not just built:**
-- Full `docker build` + `docker compose up`, then confirmed via `/health` that the DB and the
-  `host.docker.internal` route to garmin-mcp both work from inside the container.
-- An unauthenticated MCP request is refused.
-- A real headless OAuth login (register → authorize → token exchange, the same mechanism
-  `garmin_client.py` uses against garmin-mcp, run here against this server's own provider)
-  succeeds, and the resulting token makes a real authenticated tool call that persists data
-  through the volume mount -- confirmed by reading the SQLite file back from the host after
-  the container was stopped.
-- `scripts/mcp_smoke.py` was extended to log in for real rather than connecting unauthenticated,
-  plus a new check that an unauthenticated request is refused. 16/16 passing.
-
-**One real bug found during Docker verification:** `_garmin_mcp_status()`'s health probe only
-caught `httpx.HTTPError`. A malformed `GARMIN_MCP_URL` (an out-of-range port number, from the
-verification's own test config) raised `OverflowError` from deep in asyncio's socket layer --
-well outside httpx's exception hierarchy -- and crashed the `/health` endpoint entirely.
-Fixed to catch broadly, matching `_db_status`'s existing "a health check must never raise"
-principle; added as a permanent regression test in `test_server.py`.
-
-**A minimal `macro-coach` Skill ships** (see `../macro-coach`) -- logging food well, honest
-about `null`s, explicitly silent on target-setting since that engine doesn't exist yet.
-
-**What's left is the owner's to do, not buildable from here:** exposing the container
-publicly (Tailscale Funnel or equivalent -- a real, deliberate change to what's reachable
-from the internet), adding it as a Claude connector, and the actual gate below. See
-`docs/self-hosted-setup.md`.
-
-**Gate:** photograph a meal on the phone; it lands in the DB with correct macros and a stated
-confidence. Requires the owner's own phone, Claude app, and tunnel decision.
-
-### M5.5 — Targets and goals engine — done
-
-Not in the original milestone list -- inserted here because M3 scoped goal/target/day-plan
-tools out for a real reason (the weekly-budget engine they depend on didn't exist yet) and
-that gap was still open after M5. Numbered 5.5 rather than renumbering M6-M8, since nothing
-past this point depends on where exactly it sits, only that it exists before M7's proposals
-(which need a target to propose changes *to*) and M8's onboarding (which needs a goal to set
-in the first place).
-
-Builds `targets.py` (the weekly-budget-to-grams algorithm -- see "## Targets" above) and
-`goals.py` (goal lifecycle: creation, supersession, progress tracking against a snapshotted
-baseline). Wires `set_goal`, `get_goal`, `set_training_plan`, `set_day_plan`, `get_targets`
-into the MCP server, and -- meaningfully -- retires the `targets: null` placeholder `get_day`
-has returned since M1 in favor of real resolved targets when a goal exists.
-
-**Explicit non-goals for this pass:** `get_weekly_review` (the composite convenience call)
-and the full `proposal` table (`get_proposals`/`accept_proposal`/`decline_proposal`) stay
-unbuilt -- both belong with M7, where nightly recompute and staged proposals give them
-something real to compose over. `get_goal`'s `stop_condition_met` is reported honestly as a
-computed fact but does **not** auto-transition `goal.status` to `'met'` -- that transition is
-supposed to be a Claude-mediated proposal (M7), which doesn't exist yet, so an interim
-`get_goal` call reports the fact and leaves the decision where M7 will eventually formalize it.
-
-**Gate:** met. A full week resolves correctly end to end (weekly budget → day-type-weighted
-grams → `get_day` showing real targets and `remaining`) against both a synthetic case
-(`test_targets.py`/`test_goals.py`, including the infeasible-week case — clamped to 0 carbs,
-shortfall reported, protein/fat floors left untouched, not silently rebalanced) and a real
-goal set against real garmin-mcp weight data, verified through the actual running,
-authenticated MCP server: a real `set_goal` call, real `set_training_plan`/`set_day_plan`
-overrides, and `get_day` returning real `day_type: "heavy"`, real resolved
-protein/carb/fat/kcal targets, and real `remaining` computed against actual logged totals.
-
-**One real sign bug caught by the tests, not in review:** `weekly_budget`'s formula used `−`
-where the "negative = losing" rate convention (matching `get_expenditure`) required `+` — as
-written, a cut would have *raised* the budget instead of lowering it, silently inverting
-every cut/bulk target. Caught because `test_weekly_budget_cut_is_lower_than_tdee` failed
-outright, not because anyone eyeballed the arithmetic. See "## Targets" above for the fix and
-the worked example now in both the code and here.
-
-### M6 — Food library and barcode
-
-Personal library built from logged entries; Open Food Facts barcode and branded search; recipes;
-quick-repeat resolving to a prior exact entry rather than a fresh estimate.
-
-**Gate:** a repeat meal logs in one conversational turn with `source: library` and identical numbers
-to last time.
-
-### M7 — Nightly recompute, proposals, reconciliation
-
-Cron recalculates trend weight and expenditure nightly so tool calls are instant. Three staged
-proposal types, all waiting silently to be asked about:
-
-- **Target** — weekly, when the expenditure estimate has moved.
-- **Reconciliation** — a planned training day with no recorded session ("Tuesday planned heavy, no
-  session found, 350 kcal unallocated"). Claude decides the redistribution and writes it.
-- **Transition** — a goal's stop condition has tripped; its successor is proposed.
-
-**Gate:** a week of data produces a target proposal; accepting changes targets; declining leaves them
-alone and records the decline. A deliberately skipped training day produces a reconciliation proposal.
-
-### M8 — `macro-coach` Skill, complete
-
-Onboarding interview that sets initial targets from goals and stats before any expenditure data
-exists, and that handles every goal mode (cut to weight, cut to BF%, bulk to a BF ceiling, maintain)
-rather than just the owner's current one. Interpretation rules. The pinned interactive chart
-template. Explicit rules for reading macro data against `garmin-coach` — a stall with falling HRV
-and rising training load is a different problem than a stall with clean recovery.
-
-**Gate:** a cold "how's my cut going?" produces the right tool calls, a correct reading including
-stated confidence, and a chart with working hover.
-
-### Optional, later
-
-Read-only web dashboard. CSV import from MacroFactor/MyFitnessPal. REST API. Only if something
-concrete demands them.
+The server owns chart *design* so charts look identical every time rather than being
+re-invented per conversation. `get_trend` (data + statistics) stays available separately for
+when Claude needs numbers to reason about rather than a picture to show.
 
 ---
 
 ## Tool contracts
 
-All weights in **pounds**, food masses in **grams**, dates ISO `YYYY-MM-DD`, times
-`America/New_York`, day boundary **midnight**. Every tool returns compact JSON — few fields, high
-signal. The consumer is an LLM context window.
+Dates ISO `YYYY-MM-DD`, times `America/New_York`, day boundary midnight. Compact JSON — the
+consumer is an LLM context window.
+
+### Targets
+
+```
+set_targets(targets: [{date, protein_g, carb_g, fat_g, kcal?, fiber_g?, note?}])
+  -> {ok, count, dates, warnings?}
+  -- Bulk by design. Claude owns the cadence, so it writes each date explicitly; accepting a
+  -- list keeps a month-long protocol to one call instead of thirty. kcal derives via Atwater
+  -- when omitted.
+
+get_targets(date=today)          -> {date, targets, set_at, note} | targets: null + reason
+delete_targets(date)             -> {ok, date}
+```
 
 ### Logging
 
 ```
 log_food(description, meal, items[], when=None, planned=False)
-  items[]: {name, qty, unit, kcal, protein_g, carb_g, fat_g, fiber_g, confidence, source}
-  -> {ok, entry_id, day, day_totals, remaining_vs_target}
-
-log_from_library(food_id | recipe_id, qty, meal, when=None) -> same shape
-edit_entry(entry_id, ...) -> {ok, day, day_totals, recomputed}
-delete_entry(entry_id)    -> {ok, day, day_totals}
-set_day_status(day, status) -> {ok}   # complete | partial | unlogged
+log_from_library(meal, food_id|recipe_id, servings|grams, when=None, planned=False)
+edit_entry(entry_id, ...) / edit_item(item_id, ...)
+delete_entry(entry_id) / delete_item(item_id)
+set_day_status(date=today, status="complete", notes=None)
 ```
 
 ### Library
 
 ```
-save_food(...) / save_recipe(...)     -> {id}
-search_library(query, limit=10)       -> [{id, name, brand, serving_desc, macros, times_used}]
-lookup_barcode(code)                  -> {found, name, brand, serving, macros, source} | {found: false}
-search_foods(query, limit=10)         -> branded/OFF results, clearly marked by source
+save_food(...) / save_recipe(...) / search_library(query, limit)
+lookup_barcode(code)             -- M6
 ```
 
 ### Reads
 
 ```
 get_day(date=today)
-  -> {date, day_type, targets, totals, remaining, entries[], status, adherence_note}
-
-get_targets(date=today)
-  -> {date, day_type, kcal, protein_g, carb_g, fat_g, fiber_g, source, week_budget_delta}
+  -> {date, status, totals, targets, remaining, over_under, entries[], confidence_mix}
 
 get_intake_trend(days=28)
-  -> {points: [{date, kcal, protein_g, carb_g, fat_g, fiber_g, status}],
-      avg_kcal_complete_days, days_complete, days_partial, days_unlogged}
+  -> {points: [{date, status, kcal, protein_g, ...}], days_complete/partial/unlogged, ...}
 
-get_expenditure(days=28)
-  -> {tdee, confidence, method, days_used, trend_weight_lb, trend_lb_per_week,
-      kcal_per_lb_used, tdee_null_reason?}
+get_trend(days=28, metrics=["kcal","protein_g",...])
+  -> {points[], targets[], rolling[], adherence{}, coverage{}, suppressed_reason?}
 
-get_goal()
-  -> {mode, rate_lb_per_week, stop_metric, stop_value, progress, projected_completion,
-      implied_rate_pct_bodyweight, successor?}
+render_trend(days=28, metric="kcal", chart="line")
+  -> {svg, width, height, points_plotted, note?}
+```
 
+### Body composition
+
+```
+log_body_comp(percent_fat, method, date=None)
 get_body_comp(days=90)
-  -> {points: [{date, percent_fat, method}], latest, pushed_to_garmin}
-
-get_weekly_review()
-  -> {week, expenditure, trend, intake_summary, adherence, day_breakdown,
-      garmin_context: {training_load, hrv, sleep, staleness}, pending_proposals[]}
 ```
 
-`get_weekly_review` is the composite convenience call, same pattern and same rationale as
-garmin-mcp's `get_readiness` — one round trip for the question the Skill asks most.
-
-### Planning and goals
+### Progress photos
 
 ```
-set_goal(mode, rate_lb_per_week, protein_g_per_lb, fat_g_per_lb_floor,
-         stop_metric, stop_value, successor_goal_id=None)
-  -> {ok, goal_id, weekly_budget, implied_rate_pct_bodyweight}
-  -- protein_g_per_lb/fat_g_per_lb_floor added post-sketch: see "## Targets" for why these
-  -- are required Claude-set parameters rather than server defaults. Supersedes any current
-  -- active goal (status -> superseded, ended_on = today) unless successor_goal_id links this
-  -- as a specific prior goal's planned next phase.
+log_body_photo(image_base64, angle="front", date=None, note=None)
+  -> {ok, day, angle, width, height, align_status, align_reason?}
+  -- base64 image, no "data:" prefix. One per (day, angle); a later save replaces it.
+  -- align_status/align_reason are honest, not blocking -- the photo is stored either way.
 
-set_training_plan(weekday_map)          -> {ok, week_budget_delta}
-set_day_plan(date, day_type | macros)   -> {ok, targets, week_budget_delta}
-log_body_comp(date, percent_fat, method, push_to_garmin=False)
-  -> {ok, pushed, push_error?}
-
-get_proposals(kind=None)                -> [{id, kind, created_on, payload, rationale_inputs}]
-accept_proposal(id) / decline_proposal(id, reason?) -> {ok, applied}
+get_body_photo(date=None, angle="front")  -> {day, angle, photo, photo_null_reason?}
+list_body_photos(angle="front", start=None, end=None)  -> {angle, start, end, photos[]}
+delete_body_photo(date, angle="front")  -> {ok, day, angle, existed}
 ```
 
-`set_goal` always returns `implied_rate_pct_bodyweight`. It never refuses a value. Reporting is not
-gating — this is the agreed treatment of safety limits.
+No tool returns the image itself — metadata only. Viewing photos is `/dashboard`'s job, not
+chat's; a base64 image round-tripped through a tool call would be an expensive way to show a
+picture a browser can just fetch.
 
 ---
 
@@ -536,64 +316,86 @@ gating — this is the agreed treatment of safety limits.
 ```
 macro-mcp/
 ├── src/macro_mcp/
-│   ├── server.py        # FastMCP app, tool registration
-│   ├── oauth.py         # OAuth 2.1 / DCR provider (copied from garmin-mcp)
-│   ├── garmin_client.py # MCP client for garmin-mcp
-│   ├── expenditure.py   # trend weight + TDEE engine
-│   ├── targets.py       # weekly budget -> per-day resolution
-│   ├── goals.py         # goal phases, stop conditions, transitions
-│   ├── foods.py         # library, recipes, Open Food Facts
-│   ├── store.py         # SQLite access
-│   └── models.py        # return shapes
+│   ├── server.py      # FastMCP app, tool registration
+│   ├── oauth.py       # OAuth 2.1 + DCR provider
+│   ├── auth.py        # rate limiting
+│   ├── foods.py       # logging, library, recipes, get_day
+│   ├── targets.py     # stored targets (no derivation)
+│   ├── trends.py      # rolling averages, adherence, coverage
+│   ├── charts.py       # dependency-free SVG rendering
+│   ├── body.py         # body composition
+│   ├── body_photos.py  # progress photos: storage + pose-landmark alignment
+│   ├── garmin_weight.py # narrow, read-only weight fetch for the dashboard only
+│   ├── dashboard.py    # renders /dashboard's HTML (weight/bodyfat charts + slideshow)
+│   ├── store.py        # SQLite schema and access
+│   └── models.py       # shared types and validation
+├── models/
+│   └── pose_landmarker_lite.task  # fetched at Docker build time, gitignored -- see Dockerfile
 ├── scripts/
-│   ├── calibrate.py     # M1 estimation calibration harness
-│   ├── simulate.py      # M2 synthetic-series validation
-│   ├── nightly.py       # recompute + stage proposals
+│   ├── log_cli.py     # local logging CLI
+│   ├── calibrate.py   # estimation-accuracy harness
+│   ├── mcp_smoke.py   # end-to-end MCP check
 │   └── export_csv.py
-├── tests/
-├── Dockerfile
-├── compose.yml
-├── .env.example
-├── SPEC.md
-└── README.md
+├── docs/self-hosted-setup.md
+└── compose.yml
 ```
 
-## Config (env)
+## Config
 
 ```
 SQLITE_PATH=/data/macro.db
+OAUTH_STATE_PATH=/data/oauth_state.json
 MCP_BEARER_TOKEN=
 MCP_PUBLIC_URL=
-GARMIN_MCP_URL=http://127.0.0.1:18080/mcp
-GARMIN_MCP_TOKEN=
-KCAL_PER_LB=3500
-TREND_SMOOTHING_ALPHA=0.15
-EXPENDITURE_WINDOW_DAYS=28
-EXPENDITURE_MIN_DAYS=14
-OFF_ENABLED=true
+TREND_MIN_DAYS=7          # below this, trend statistics suppress with a reason
+OFF_ENABLED=true          # Open Food Facts lookup (M6)
 TZ=America/New_York
 LOG_LEVEL=INFO
+
+# progress photos + dashboard
+PHOTO_DIR=                # default: a "photos/" sibling of SQLITE_PATH
+POSE_MODEL_PATH=          # default: ./models/pose_landmarker_lite.task
+DASHBOARD_TOKEN=          # unset = /dashboard disabled (fails closed, not open)
+
+# dashboard's narrow, read-only weight fetch -- see "Progress photos and dashboard".
+# Reintroduced deliberately after the charter change removed the general garmin-mcp bridge;
+# not a sign the bridge is coming back wholesale.
+GARMIN_MCP_URL=
+GARMIN_MCP_TOKEN=
+GARMIN_MCP_OAUTH_STATE_PATH=/data/garmin_mcp_oauth.json
 ```
 
-## Error handling
+No `KCAL_PER_LB`, no smoothing constant, no expenditure window — those were specific to the
+deleted expenditure engine and stay gone. `GARMIN_MCP_*` came back for the dashboard's weight
+panel only (above); nothing else in this server touches garmin-mcp.
 
-- **garmin-mcp unreachable** — return weight-dependent fields as `null` with a reason naming the
-  dependency. Never substitute a last-known value without labeling its age.
-- **Open Food Facts miss or timeout** — return `{found: false}` and fall through to Claude
-  estimation. Never invent a branded product's macros.
-- **Insufficient data for expenditure** — `null` plus `tdee_null_reason`, never a low-confidence number.
-- **Body-comp push failure** — the local record still commits. Push state is recorded separately so
-  a Garmin outage never blocks goal tracking.
+---
+
+## Milestones
+
+**Done:** food logging and the personal library; body composition; the MCP server over
+Streamable HTTP; OAuth 2.1 + DCR auth; Docker packaging and public exposure; stored targets;
+trend computation; SVG charting; progress photos with pose-landmark alignment; a token-gated
+`/dashboard` combining photos with weight and body-fat % trend.
+
+**Remaining:**
+
+- **Food lookup expansion** — Open Food Facts barcode and branded search, feeding the personal
+  library. The library exists; external lookup does not.
+
+**Retired:** the expenditure engine, goal tracking, and target derivation, per the Charter
+change above.
 
 ## Testing
 
-Unit tests for the expenditure engine against synthetic series with known ground truth — this is the
-most important test suite in the project. Unit tests for target resolution and weekly-budget
-arithmetic. Integration tests with garmin-mcp mocked. One live integration test, marked and skipped
-by default, that runs read-only against the real garmin-mcp instance.
+Unit tests for storage, trend statistics, SVG generation, photo storage/alignment geometry,
+and (indirectly) the dashboard's chart/photo assembly. `scripts/mcp_smoke.py` starts a real
+server, completes a real OAuth login, and exercises every tool over the wire, plus the
+dashboard's HTTP routes with and without a valid token — the check that matters, since it is
+the only one that tests the transport and auth path a real client (or browser) uses.
 
-## Backup
-
-The SQLite file is the entire system of record for food, library, goals, and body composition. A
-documented backup path and `scripts/export_csv.py` ship in M1, not as an afterthought — the owner
-should never be trapped in this thing.
+Photo alignment's geometry (`_landmark_geometry`, `_affine_coeffs` in `body_photos.py`) is
+unit-tested with synthetic landmark coordinates, independent of MediaPipe. Actual pose
+detection is exercised live by `mcp_smoke.py` when the `photos` extra and its model file are
+installed, but degrades to "stored, unaligned" rather than failing when they aren't — see
+"Progress photos and dashboard".

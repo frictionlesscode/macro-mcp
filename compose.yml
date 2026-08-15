@@ -11,6 +11,10 @@ services:
       - MCP_PUBLIC_URL=${MCP_PUBLIC_URL}
       - GARMIN_MCP_URL=${GARMIN_MCP_URL}
       - GARMIN_MCP_TOKEN=${GARMIN_MCP_TOKEN}
+      # Gates /dashboard (progress photos + weight/body-fat trend). A separate secret from
+      # MCP_BEARER_TOKEN on purpose -- see server.py's _dashboard_authorized. Unset means the
+      # dashboard is disabled (fails closed), not open.
+      - DASHBOARD_TOKEN=${DASHBOARD_TOKEN}
     volumes:
       - ./data:/data
     extra_hosts:

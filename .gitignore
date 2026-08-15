@@ -11,3 +11,8 @@ data/
 *.egg-info/
 build/
 dist/
+
+# Pose-landmark model (body_photos.py) -- fetched by Dockerfile at build time or manually
+# for local dev (see docs/self-hosted-setup.md), not checked in: it's a ~5.5MB binary that
+# doesn't belong in git history and would go stale against upstream releases if it were.
+models/*.task

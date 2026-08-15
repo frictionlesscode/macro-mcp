@@ -1,7 +1,7 @@
 """SQLite access and schema.
 
-The whole system of record for food, library, goals, and body composition is one file.
-See README "Backup" — that file is the thing worth protecting.
+The whole system of record for food, the library, stored targets, and body composition is one
+file. See README "Backup" — that file is the thing worth protecting.
 """
 
 from __future__ import annotations
@@ -14,23 +14,16 @@ from typing import Iterator
 
 from .models import now, iso
 
-#: Bumped when the targets engine added goal.protein_g_per_lb/fat_g_per_lb_floor/
-#: start_weight_lb/start_percent_fat. No real deployment exists yet to migrate, so this is a
-#: straight schema edit (CREATE TABLE IF NOT EXISTS won't retroactively add columns to an
-#: existing file) rather than a real migration -- worth revisiting once a real DB is at stake.
-SCHEMA_VERSION = 2
+#: v3 dropped the server-side target-derivation tables (goal, day_type, training_plan,
+#: day_plan, proposal) in favour of a single day_target table holding exactly what Claude set
+#: -- see SPEC.md "Charter change (2026-08-14)". There was no live data to migrate, so this is
+#: a straight replacement rather than a migration; CREATE TABLE IF NOT EXISTS will not drop
+#: the retired tables from an older file, so an existing database must be recreated.
+#: v4 added body_photo (progress photos + cached pose landmarks) -- purely additive, no
+#: existing table changed.
+SCHEMA_VERSION = 4
 
 DEFAULT_DB_PATH = "./data/macro.db"
-
-# Seeded day types. Weights are relative, not absolute: the weekly energy budget is divided
-# across the week in proportion to each day's energy_weight. carb_weight biases how a day's
-# share is split once protein and the fat floor are satisfied. Both are tunable — the owner's
-# programme, not ours, decides what "heavy" means.
-DEFAULT_DAY_TYPES = [
-    ("rest", 0.90, 0.80),
-    ("moderate", 1.00, 1.00),
-    ("heavy", 1.15, 1.30),
-]
 
 SCHEMA = """
 CREATE TABLE IF NOT EXISTS day_log (
@@ -104,7 +97,8 @@ CREATE INDEX IF NOT EXISTS ix_entry_day ON food_entry(day);
 CREATE INDEX IF NOT EXISTS ix_entry_group ON food_entry(group_id);
 
 -- Body composition. Weight deliberately lives in garmin-mcp, not here; body fat lives here
--- because garmin-mcp declared body composition a non-goal and goals can terminate on BF%.
+-- because garmin-mcp declared body composition a non-goal, leaving this the only home for it.
+-- Tracking only -- nothing derives from it (SPEC.md "Data model").
 CREATE TABLE IF NOT EXISTS body_comp (
     day               TEXT PRIMARY KEY,
     percent_fat       REAL NOT NULL CHECK (percent_fat > 0 AND percent_fat < 100),
@@ -115,55 +109,40 @@ CREATE TABLE IF NOT EXISTS body_comp (
     updated_at        TEXT NOT NULL
 );
 
-CREATE TABLE IF NOT EXISTS goal (
-    id                  INTEGER PRIMARY KEY AUTOINCREMENT,
-    mode                TEXT NOT NULL CHECK (mode IN ('cut','bulk','maintain')),
-    rate_lb_per_week    REAL NOT NULL,
-    protein_g_per_lb    REAL NOT NULL CHECK (protein_g_per_lb > 0),
-    fat_g_per_lb_floor  REAL NOT NULL CHECK (fat_g_per_lb_floor > 0),
-    stop_metric         TEXT NOT NULL CHECK (stop_metric IN ('weight','bodyfat','date','none')),
-    stop_value          TEXT,
-    start_weight_lb     REAL,
-    start_percent_fat   REAL,
-    successor_goal_id   INTEGER REFERENCES goal(id),
-    status              TEXT NOT NULL CHECK (status IN ('active','met','superseded','abandoned')),
-    started_on          TEXT NOT NULL,
-    ended_on            TEXT,
-    created_at          TEXT NOT NULL
-);
-CREATE INDEX IF NOT EXISTS ix_goal_status ON goal(status);
-
-CREATE TABLE IF NOT EXISTS day_type (
-    name          TEXT PRIMARY KEY,
-    energy_weight REAL NOT NULL CHECK (energy_weight > 0),
-    carb_weight   REAL NOT NULL CHECK (carb_weight > 0)
+-- Targets exactly as Claude set them for a date. No day types, no relative weights, no
+-- recurrence, no derivation -- Claude owns the cadence and writes each date explicitly.
+-- Replaces the goal / day_type / training_plan / day_plan / proposal tables, which
+-- implemented server-side target derivation; see SPEC.md "Charter change (2026-08-14)".
+CREATE TABLE IF NOT EXISTS day_target (
+    day        TEXT PRIMARY KEY,
+    kcal       REAL NOT NULL CHECK (kcal >= 0),
+    protein_g  REAL NOT NULL CHECK (protein_g >= 0),
+    carb_g     REAL NOT NULL CHECK (carb_g >= 0),
+    fat_g      REAL NOT NULL CHECK (fat_g >= 0),
+    fiber_g    REAL NOT NULL DEFAULT 0 CHECK (fiber_g >= 0),
+    note       TEXT,
+    set_at     TEXT NOT NULL
 );
 
-CREATE TABLE IF NOT EXISTS training_plan (
-    weekday  INTEGER PRIMARY KEY CHECK (weekday BETWEEN 0 AND 6),
-    day_type TEXT NOT NULL REFERENCES day_type(name)
+-- Progress photos. One per (day, angle) -- a later save for the same day+angle overwrites,
+-- matching day_target's upsert-by-date pattern. file_path points at a JPEG under PHOTO_DIR;
+-- the image itself is never stored in the DB. landmarks_json caches the pose landmarks
+-- detected at save time (see body_photos.py) so alignment for the dashboard doesn't re-run
+-- pose detection on every render; it is null when detection failed or wasn't available.
+CREATE TABLE IF NOT EXISTS body_photo (
+    day            TEXT NOT NULL,
+    angle          TEXT NOT NULL DEFAULT 'front' CHECK (angle IN ('front','side','back')),
+    file_path      TEXT NOT NULL,
+    width          INTEGER NOT NULL,
+    height         INTEGER NOT NULL,
+    landmarks_json TEXT,
+    align_status   TEXT NOT NULL DEFAULT 'pending' CHECK (align_status IN ('pending','ok','failed')),
+    align_reason   TEXT,
+    note           TEXT,
+    created_at     TEXT NOT NULL,
+    PRIMARY KEY (day, angle)
 );
-
-CREATE TABLE IF NOT EXISTS day_plan (
-    day             TEXT PRIMARY KEY,
-    day_type        TEXT REFERENCES day_type(name),
-    explicit_macros TEXT,
-    source          TEXT NOT NULL CHECK (source IN ('plan','override','reconciled')),
-    updated_at      TEXT NOT NULL,
-    CHECK (day_type IS NOT NULL OR explicit_macros IS NOT NULL)
-);
-
-CREATE TABLE IF NOT EXISTS proposal (
-    id         INTEGER PRIMARY KEY AUTOINCREMENT,
-    kind       TEXT NOT NULL CHECK (kind IN ('target','transition','reconciliation')),
-    created_on TEXT NOT NULL,
-    payload    TEXT NOT NULL,
-    status     TEXT NOT NULL DEFAULT 'pending'
-               CHECK (status IN ('pending','accepted','declined')),
-    decided_on TEXT,
-    decline_reason TEXT
-);
-CREATE INDEX IF NOT EXISTS ix_proposal_status ON proposal(status);
+CREATE INDEX IF NOT EXISTS ix_body_photo_angle ON body_photo(angle);
 """
 
 
@@ -186,17 +165,7 @@ def connect(path: str | Path | None = None) -> sqlite3.Connection:
 
 def init_schema(conn: sqlite3.Connection) -> None:
     conn.executescript(SCHEMA)
-    _seed_day_types(conn)
     conn.execute(f"PRAGMA user_version = {SCHEMA_VERSION}")
-
-
-def _seed_day_types(conn: sqlite3.Connection) -> None:
-    for name, energy, carb in DEFAULT_DAY_TYPES:
-        conn.execute(
-            "INSERT OR IGNORE INTO day_type (name, energy_weight, carb_weight) "
-            "VALUES (?, ?, ?)",
-            (name, energy, carb),
-        )
 
 
 def schema_version(conn: sqlite3.Connection) -> int:
@@ -226,8 +195,8 @@ def touch_day(conn: sqlite3.Connection, day: str) -> None:
     """Ensure a day_log row exists for a day that now has entries.
 
     Defaults to ``partial``, never ``complete``. Logging breakfast does not mean the day is
-    fully logged, and assuming otherwise would feed a half-day's intake into the expenditure
-    fit as if it were a real deficit.
+    fully logged, and assuming otherwise would feed a half-day's intake into trend statistics
+    as if it were the whole day's real total.
     """
     conn.execute(
         "INSERT INTO day_log (day, status, updated_at) VALUES (?, 'partial', ?) "

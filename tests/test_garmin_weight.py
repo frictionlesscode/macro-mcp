@@ -1,4 +1,4 @@
-"""Unit tests for the pure logic in garmin_client.py, plus one opt-in integration test.
+"""Unit tests for the pure logic in garmin_weight.py, plus one opt-in integration test.
 
 The OAuth handshake itself (register -> authorize -> token exchange -> refresh) was verified
 live against the real, running garmin-mcp instance during M4's build -- see SPEC.md's M4
@@ -18,8 +18,8 @@ import time
 
 import pytest
 
-from macro_mcp import garmin_client
-from macro_mcp.garmin_client import GarminBridgeError, _TokenSet
+from macro_mcp import garmin_weight
+from macro_mcp.garmin_weight import GarminBridgeError, _TokenSet
 
 
 # --- pure logic: token freshness, URL derivation, caching -----------------------
@@ -45,28 +45,28 @@ def test_token_freshness_respects_the_expiry_skew_buffer():
 
 def test_base_url_strips_trailing_mcp_suffix(monkeypatch):
     monkeypatch.setenv("GARMIN_MCP_URL", "http://127.0.0.1:18080/mcp")
-    assert garmin_client._base_url() == "http://127.0.0.1:18080"
+    assert garmin_weight._base_url() == "http://127.0.0.1:18080"
 
 
 def test_base_url_leaves_non_mcp_suffixed_url_alone(monkeypatch):
     monkeypatch.setenv("GARMIN_MCP_URL", "http://127.0.0.1:18080")
-    assert garmin_client._base_url() == "http://127.0.0.1:18080"
+    assert garmin_weight._base_url() == "http://127.0.0.1:18080"
 
 
 def test_mcp_url_has_a_sane_default(monkeypatch):
     monkeypatch.delenv("GARMIN_MCP_URL", raising=False)
-    assert garmin_client._mcp_url() == "http://127.0.0.1:18080/mcp"
+    assert garmin_weight._mcp_url() == "http://127.0.0.1:18080/mcp"
 
 
 def test_bearer_token_missing_raises_with_actionable_message(monkeypatch):
     monkeypatch.delenv("GARMIN_MCP_TOKEN", raising=False)
     with pytest.raises(GarminBridgeError, match="GARMIN_MCP_TOKEN"):
-        garmin_client._bearer_token()
+        garmin_weight._bearer_token()
 
 
 def test_bearer_token_returns_configured_value(monkeypatch):
     monkeypatch.setenv("GARMIN_MCP_TOKEN", "the-secret")
-    assert garmin_client._bearer_token() == "the-secret"
+    assert garmin_weight._bearer_token() == "the-secret"
 
 
 # --- token cache round-trip --------------------------------------------------------
@@ -77,28 +77,28 @@ def test_cache_round_trips_a_token_set(tmp_path, monkeypatch):
     monkeypatch.setenv("GARMIN_MCP_OAUTH_STATE_PATH", str(cache_path))
 
     tokens = _TokenSet("cid", "secret", "access-tok", "refresh-tok", expires_at=1234.5)
-    garmin_client._save_cached(tokens)
+    garmin_weight._save_cached(tokens)
 
-    loaded = garmin_client._load_cached()
+    loaded = garmin_weight._load_cached()
     assert loaded == tokens
 
 
 def test_cache_miss_returns_none(tmp_path, monkeypatch):
     monkeypatch.setenv("GARMIN_MCP_OAUTH_STATE_PATH", str(tmp_path / "does-not-exist.json"))
-    assert garmin_client._load_cached() is None
+    assert garmin_weight._load_cached() is None
 
 
 def test_corrupt_cache_is_treated_as_a_miss_not_a_crash(tmp_path, monkeypatch):
     cache_path = tmp_path / "garmin_oauth.json"
     cache_path.write_text("not valid json{{{", encoding="utf-8")
     monkeypatch.setenv("GARMIN_MCP_OAUTH_STATE_PATH", str(cache_path))
-    assert garmin_client._load_cached() is None
+    assert garmin_weight._load_cached() is None
 
 
 def test_cache_write_is_atomic_no_tmp_file_left_behind(tmp_path, monkeypatch):
     cache_path = tmp_path / "garmin_oauth.json"
     monkeypatch.setenv("GARMIN_MCP_OAUTH_STATE_PATH", str(cache_path))
-    garmin_client._save_cached(_TokenSet("cid", "secret", "a", "r", expires_at=1.0))
+    garmin_weight._save_cached(_TokenSet("cid", "secret", "a", "r", expires_at=1.0))
     assert cache_path.exists()
     assert not cache_path.with_suffix(".tmp").exists()
 
@@ -107,7 +107,7 @@ def test_cache_write_is_atomic_no_tmp_file_left_behind(tmp_path, monkeypatch):
 
 
 def test_wrap_request_error_names_the_step_and_exception_type():
-    err = garmin_client._wrap_request_error("token exchange", ConnectionError("boom"))
+    err = garmin_weight._wrap_request_error("token exchange", ConnectionError("boom"))
     assert "token exchange" in str(err)
     assert "ConnectionError" in str(err)
     assert "boom" in str(err)
@@ -136,7 +136,7 @@ def test_get_weight_points_against_real_garmin_mcp():
     """
     import asyncio
 
-    points = asyncio.run(garmin_client.get_weight_points(days=30))
+    points = asyncio.run(garmin_weight.get_weight_points(days=30))
     assert isinstance(points, list)
     if points:  # the account may have zero weigh-ins in some future test environment
         assert {"date", "weight_lb"} <= set(points[0].keys())

@@ -1,4 +1,11 @@
-"""macro-mcp as an MCP client of garmin-mcp: pulls trend weight for the expenditure engine.
+"""macro-mcp as an MCP client of garmin-mcp: reads trend weight for the /dashboard route.
+
+This is deliberately narrow -- SPEC.md's charter change (2026-08-14) retired the general
+garmin-mcp bridge that used to feed the (now-deleted) expenditure engine. This module exists
+only because the body-photo dashboard wants a weight line next to the photos and body-fat %,
+and weight is a locked non-goal here (garmin-mcp owns it -- see SPEC.md "Locked decisions").
+It reads one trend and nothing else; it does not write, and nothing downstream derives a
+target or a plan from what it returns.
 
 garmin-mcp's own auth (SPEC.md there: OAuth 2.1 + Dynamic Client Registration) has no static-
 bearer shortcut, even for a same-host client -- its `/authorize` endpoint gates on
@@ -9,15 +16,15 @@ the human flow would send, exchange the resulting code for an access/refresh tok
 it, and refresh it before it expires. Every step here was verified against the real, running
 garmin-mcp instance during M4 (register -> 201, authorize -> 302 with a code, code -> token
 exchange, refresh_token grant -> new access token, and a live get_body_trend call returning
-real data) -- not written from the OAuth spec alone.
+real data) -- not written from the OAuth spec alone; this module is that same, proven client,
+narrowed down to the one call the dashboard needs.
 
 This module never sees a Garmin credential. It holds a garmin-mcp access token, which is a
 macro-mcp-to-garmin-mcp secret -- a different, narrower thing than the Garmin login itself.
 
-Degrades honestly (SPEC.md's M4 requirement): any failure -- garmin-mcp unreachable, login
-rejected, a tool error -- raises GarminBridgeError with a specific, stated reason. Callers
-(server.py's get_expenditure) catch it and report weight data as unavailable, never fabricate
-or estimate it.
+Degrades honestly: any failure -- garmin-mcp unreachable, login rejected, a tool error --
+raises GarminBridgeError with a specific, stated reason. dashboard.py catches it and renders
+the weight panel as unavailable with that reason, never a fabricated or estimated number.
 """
 
 from __future__ import annotations
@@ -235,12 +242,8 @@ async def _ensure_token(http: httpx.AsyncClient) -> _TokenSet:
 
 
 async def get_weight_points(days: int = 90) -> list[dict[str, Any]]:
-    """Trend weight points from garmin-mcp's get_body_trend, in the exact {date, weight_lb}
-    shape expenditure.compute_trend expects -- verified live, no reshaping needed.
-
-    Requests more history than the expenditure engine's analysis window by default (``days``
-    here should exceed EXPENDITURE_WINDOW_DAYS) so the EWMA has room to warm up before the
-    window it's actually being judged over starts.
+    """Trend weight points from garmin-mcp's get_body_trend, as {date, weight_lb} -- verified
+    live against the real instance, no reshaping needed. Used only by dashboard.py.
     """
     async with httpx.AsyncClient(base_url=_base_url(), timeout=15.0) as http:
         tokens = await _ensure_token(http)

@@ -1,10 +1,12 @@
 #!/usr/bin/env python
 """M1 calibration harness — how wrong is the estimate, and in which direction?
 
-Everything downstream rests on estimation accuracy. A biased intake estimate produces a
-biased expenditure estimate, which produces wrong macro targets that look perfectly
-reasonable. This harness exists so that error is a measured number with a sample size
-attached, not an impression.
+Everything downstream rests on estimation accuracy. This server tracks intake against
+whatever targets Claude sets and reports adherence -- there is no downstream mechanism that
+compensates for a biased estimate the way an inferred expenditure figure once did. A
+consistent 15% under-estimate here just means every adherence number is wrong by 15%, plainly
+and permanently, until it's caught. This harness exists so that error is a measured number
+with a sample size attached, not an impression.
 
 Two conditions are measured separately, because they fail differently:
 
@@ -27,10 +29,11 @@ Workflow
 
 4. python scripts/calibrate.py report
 
-Bias matters more than spread. A consistent 15% under-estimate is largely absorbed by the
-expenditure engine — the target it derives comes out correspondingly low and the goal rate
-is still met. Scatter with no bias is noise the trend fit can average out. What breaks the
-system is bias that *changes* over time. The report separates these.
+Bias matters more than spread. Scatter with no bias averages out over enough logged days --
+some meals overestimated, some under, roughly cancelling in any trend or adherence figure
+computed over a window. A consistent bias does not cancel; it shifts every average and every
+"days over target" count by the same fixed amount, quietly, for as long as it goes unnoticed.
+The report separates the two because they call for different fixes.
 """
 
 from __future__ import annotations

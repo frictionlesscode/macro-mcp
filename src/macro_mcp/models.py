@@ -16,8 +16,8 @@ from zoneinfo import ZoneInfo
 
 MEALS = ("breakfast", "lunch", "dinner", "snack", "other")
 
-#: Where a number came from. Ordered best-to-worst; the expenditure engine and the
-#: calibration harness both care about this distinction.
+#: Where a number came from. Ordered best-to-worst; the calibration harness cares about
+#: this distinction when scoring estimate accuracy.
 SOURCES = ("label", "barcode", "library", "estimate")
 
 #: Coarse buckets rather than a float. An LLM sets these far more consistently than it
@@ -25,7 +25,7 @@ SOURCES = ("label", "barcode", "library", "estimate")
 CONFIDENCES = ("high", "medium", "low")
 
 #: ``unlogged`` is the absence of data, not a zero-intake day. Only ``complete`` days are
-#: eligible for the expenditure fit — see SPEC.md, "A day with no logged food is unknown".
+#: eligible for trend statistics — see SPEC.md, "A day with no logged food is unknown".
 DAY_STATUSES = ("complete", "partial", "unlogged")
 
 GOAL_MODES = ("cut", "bulk", "maintain")
@@ -36,6 +36,8 @@ PROPOSAL_KINDS = ("target", "transition", "reconciliation")
 PROPOSAL_STATUSES = ("pending", "accepted", "declined")
 
 BODY_COMP_METHODS = ("scale", "calipers", "dexa", "estimate")
+
+PHOTO_ANGLES = ("front", "side", "back")
 
 MACRO_FIELDS = ("kcal", "protein_g", "carb_g", "fat_g", "fiber_g")
 

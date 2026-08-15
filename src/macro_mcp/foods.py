@@ -1,8 +1,9 @@
 """Food logging, the personal library, and recipes.
 
-M1 scope. Targets and expenditure are not computed here — see SPEC.md milestones. Where a
-target-dependent field would normally appear, this module returns ``None`` alongside a
-``*_reason``, rather than inventing a placeholder.
+Targets are not looked up here — see SPEC.md's Charter: this module is the raw log layer,
+and stored-target lookup belongs to targets.py / server.py. Where a target-dependent field
+would normally appear, this module returns ``None`` alongside a ``*_reason``, rather than
+inventing a placeholder.
 """
 
 from __future__ import annotations
@@ -567,19 +568,20 @@ def get_day(conn: sqlite3.Connection, day: Date | str | None = None) -> dict[str
         "planned_totals": planned.as_dict() if planned.kcal else None,
         "entries": list(entries.values()),
         "entry_count": len(entries),
-        # Targets are deliberately not resolved here. This module is the raw food-log layer
-        # and has no access to the active goal or to garmin-mcp's weight data; server.py's
-        # get_day tool overlays real targets (or a specific reason they're unavailable) on
-        # top of this. Callers that use this function directly -- notably scripts/log_cli.py
-        # -- get this placeholder instead, so it must describe *that* situation accurately
-        # rather than the state of the codebase. It previously read "target engine not
-        # implemented until M3", which was true when written but became misleading once the
-        # engine shipped: read out of context it implied a missing feature rather than an
-        # unset goal.
+        # Targets are deliberately not looked up here. This module is the raw food-log layer
+        # and has no access to the day_target table; server.py's get_day tool overlays the
+        # stored target (or a specific reason none was set) on top of this. Callers that use
+        # this function directly -- notably scripts/log_cli.py -- get this placeholder
+        # instead, so it must describe *that* situation accurately. An earlier version of
+        # this message read "target engine not implemented until M3", which was true when
+        # written but became actively misleading once a target engine existed -- read out of
+        # context it implied a missing feature rather than an unset value. The engine it
+        # referred to was later removed entirely (SPEC.md "Charter change"); the lesson about
+        # not encoding build state into a runtime message outlived the engine itself.
         "targets": None,
         "targets_null_reason": (
-            "not resolved by this layer -- use the get_day MCP tool or get_targets, which "
-            "apply the active goal and current expenditure"
+            "not resolved by this layer -- use the get_day or get_targets MCP tools, which "
+            "read the stored day_target table"
         ),
         "remaining": None,
         "confidence_mix": _confidence_mix(rows),
@@ -599,7 +601,7 @@ def get_intake_trend(conn: sqlite3.Connection, days: int = 28) -> dict[str, Any]
     """Daily intake over a window, with each day's logging status attached.
 
     Days with no entries appear with ``status: unlogged`` and ``null`` macros — never zeros.
-    The expenditure engine (M2) depends on that distinction being preserved here.
+    Trend statistics (trends.py) depend on that distinction being preserved here.
     """
     if days <= 0:
         raise ValidationError("days must be positive")
