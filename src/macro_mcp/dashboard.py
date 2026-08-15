@@ -1,16 +1,19 @@
-"""Renders the /dashboard page: weight + body-fat % trend charts, and an aligned
-progress-photo slideshow. server.py owns the route, the token gate, and the separate
-/dashboard/photo image endpoint -- this module only builds HTML and answers "what photos
-are there to show".
+"""Renders the /dashboard page: a combined weight + body-fat % trend chart, and an aligned
+progress-photo slideshow synced to it. server.py owns the route, the token gate, and the
+separate /dashboard/photo image endpoint -- this module only builds HTML and answers "what
+photos are there to show".
 
 No JS framework, no CDN, no build step -- the same reasoning as charts.py: this has to run
 self-hosted behind a Tailscale Funnel with nothing external to fetch. The slideshow is
-~40 lines of vanilla JS that swaps one <img>'s src on a timer; the browser caches each
-photo after its first load, so scrubbing back and forth is instant after the first pass.
+vanilla JS that swaps one <img>'s src on a timer; the browser caches each photo after its
+first load, so scrubbing back and forth is instant after the first pass. Hovering the chart
+pauses that timer and drives the same <img> from cursor position instead, via the date-based
+x-axis geometry charts.dual_axis_chart embeds as data-* attributes on its <svg>.
 """
 
 from __future__ import annotations
 
+import json
 import sqlite3
 from datetime import date as Date
 from typing import Any
@@ -30,8 +33,9 @@ _CSS = """
   .stats { display: flex; gap: 24px; margin-bottom: 16px; flex-wrap: wrap; }
   .stat .n { font-size: 22px; font-weight: 600; }
   .stat .l { font-size: 12px; color: #888; }
-  .charts { display: flex; gap: 12px; flex-wrap: wrap; margin-bottom: 20px; }
-  .charts > div { flex: 1 1 320px; max-width: 100%; }
+  .chart-wrap { max-width: 720px; margin-bottom: 4px; position: relative; }
+  .chart-wrap svg { cursor: crosshair; }
+  .chart-note { font-size: 12px; color: #888; margin: 0 0 20px; }
   .null { padding: 40px; text-align: center; color: #888; border: 1px dashed #999;
           border-radius: 6px; }
   nav a { margin-right: 10px; font-size: 13px; text-decoration: none; color: #2563eb; }
@@ -45,28 +49,49 @@ _CSS = """
   .controls input[type=range] { width: 120px; }
   .controls button { font-size: 13px; padding: 4px 10px; cursor: pointer; }
   .frame-label { font-size: 13px; color: #888; margin-top: 4px; }
+  .hover-tip { position: fixed; display: none; pointer-events: none; z-index: 10;
+               background: rgba(20, 20, 22, 0.92); color: #f2f2f7; font-size: 12px;
+               line-height: 1.5; padding: 6px 10px; border-radius: 5px; white-space: nowrap; }
 """
 
 
-async def _weight_chart(days: int) -> dict[str, Any]:
+async def _weight_bodyfat_chart(conn: sqlite3.Connection, days: int) -> dict[str, Any]:
+    """Fetches both series and renders them as one chart. Weight failing to load (garmin-mcp
+    unreachable, no token configured, etc.) doesn't block body fat from rendering -- but the
+    reason is carried back separately so the page can say why weight is missing rather than
+    silently showing only half the chart with no explanation.
+    """
+    start = Date.fromordinal(today().toordinal() - days + 1)
+    end = today()
+
+    weight_error: str | None = None
     try:
-        points = await get_weight_points(days=days)
+        weight_points = await get_weight_points(days=days)
+        weight_by_date = {p["date"]: p["weight_lb"] for p in weight_points}
     except GarminBridgeError as exc:
-        return {"svg": None, "svg_null_reason": str(exc)}
-    series = [{"date": p["date"], "value": p["weight_lb"]} for p in points]
-    return charts.point_series_chart(series, "Weight (lb)")
+        weight_by_date = {}
+        weight_error = str(exc)
 
+    comp = body.get_body_comp(conn, days)
+    bf_by_date = {p["date"]: p["percent_fat"] for p in comp["points"]}
+    # method="estimate" covers both a typed guess and a Claude-vision read from a shared
+    # photo (see macro-coach's SKILL.md) -- either way it's not a real measurement, so the
+    # chart marks it distinctly rather than sitting indistinguishable next to scale readings.
+    bf_estimated = {p["date"]: p["method"] == "estimate" for p in comp["points"]}
 
-def _bodyfat_chart(conn: sqlite3.Connection, days: int) -> dict[str, Any]:
-    result = body.get_body_comp(conn, days)
-    series = [{"date": p["date"], "value": p["percent_fat"]} for p in result["points"]]
-    return charts.point_series_chart(series, "Body fat %")
-
-
-def _chart_block(chart: dict[str, Any]) -> str:
-    if chart["svg"]:
-        return chart["svg"]
-    return f'<div class="null">{escape(chart["svg_null_reason"])}</div>'
+    chart = charts.dual_axis_chart(
+        start.isoformat(), end.isoformat(),
+        weight_by_date, "Weight (lb)",
+        bf_by_date, "Body fat %",
+        right_estimated=bf_estimated,
+    )
+    return {
+        "chart": chart,
+        "weight_by_date": weight_by_date,
+        "bf_by_date": bf_by_date,
+        "weight_error": weight_error,
+        "latest_bf": comp["latest"]["percent_fat"] if comp["latest"] else None,
+    }
 
 
 def _nav(angle: str, days: int, token: str) -> str:
@@ -81,23 +106,27 @@ def _nav(angle: str, days: int, token: str) -> str:
 
 
 async def render_page(conn: sqlite3.Connection, angle: str, days: int, token: str) -> str:
-    weight = await _weight_chart(days)
-    bodyfat = _bodyfat_chart(conn, days)
-    comp = body.get_body_comp(conn, days)
+    trend = await _weight_bodyfat_chart(conn, days)
+    chart = trend["chart"]
 
     start = Date.fromordinal(today().toordinal() - days + 1)
     listing = body_photos.list_photos(conn, angle=angle, start=start.isoformat())
     photo_days = [p["day"] for p in listing["photos"]]
     unaligned_count = sum(1 for p in listing["photos"] if p["align_status"] != "ok")
 
-    latest_bf = comp["latest"]["percent_fat"] if comp["latest"] else None
-
     stats = []
-    if latest_bf is not None:
-        stats.append(f'<div class="stat"><div class="n">{latest_bf:.1f}%</div>'
+    if trend["latest_bf"] is not None:
+        stats.append(f'<div class="stat"><div class="n">{trend["latest_bf"]:.1f}%</div>'
                       f'<div class="l">latest body fat</div></div>')
     stats.append(f'<div class="stat"><div class="n">{len(photo_days)}</div>'
                   f'<div class="l">{escape(angle)} photos in window</div></div>')
+
+    if chart["svg"]:
+        chart_html = f'<div class="chart-wrap">{chart["svg"]}</div>'
+    else:
+        chart_html = f'<div class="null">{escape(chart["svg_null_reason"])}</div>'
+    if trend["weight_error"]:
+        chart_html += f'<p class="chart-note">Weight unavailable: {escape(trend["weight_error"])}</p>'
 
     if photo_days:
         urls = [f"/dashboard/photo?day={d}&angle={angle}&token={token}" for d in photo_days]
@@ -115,38 +144,149 @@ async def render_page(conn: sqlite3.Connection, angle: str, days: int, token: st
           {f'<div class="frame-label">{unaligned_count} of {len(photo_days)} unaligned '
            f'(no clear pose detected) -- shown as originally framed</div>' if unaligned_count else ''}
         </div>
-        <script>
-          const urls = {urls!r};
-          const dates = {photo_days!r};
-          let i = urls.length - 1, playing = true, timer = null;
-          const img = document.getElementById('slide');
-          const label = document.getElementById('frame-label');
-          const speed = document.getElementById('speed');
-          function show(n) {{
-            i = ((n % urls.length) + urls.length) % urls.length;
-            img.src = urls[i];
-            label.textContent = dates[i] + '  (' + (i + 1) + ' / ' + urls.length + ')';
-          }}
-          function tick() {{ show(i + 1); }}
-          function restart() {{
-            if (timer) clearInterval(timer);
-            if (playing) timer = setInterval(tick, parseInt(speed.value, 10));
-          }}
-          document.getElementById('prev').onclick = () => {{ playing = false; restart();
-            document.getElementById('playpause').textContent = 'play'; show(i - 1); }};
-          document.getElementById('next').onclick = () => {{ playing = false; restart();
-            document.getElementById('playpause').textContent = 'play'; show(i + 1); }};
-          document.getElementById('playpause').onclick = (e) => {{
-            playing = !playing; e.target.textContent = playing ? 'pause' : 'play'; restart();
-          }};
-          speed.oninput = restart;
-          show(i);
-          restart();
-        </script>
         """
     else:
+        urls = []
         slideshow = (f'<div class="null">no {escape(angle)} photos stored in this window '
                      f'(see log_body_photo)</div>')
+
+    script = f"""
+    <div class="hover-tip" id="hover-tip"></div>
+    <script>
+      const photoDates = {json.dumps(photo_days)};
+      const photoUrls = {json.dumps(urls)};
+      const weightByDate = {json.dumps(trend["weight_by_date"])};
+      const bfByDate = {json.dumps(trend["bf_by_date"])};
+
+      let i = photoUrls.length - 1, playing = true, timer = null, wasPlaying = true;
+      const img = document.getElementById('slide');
+      const label = document.getElementById('frame-label');
+      const speed = document.getElementById('speed');
+      const playBtn = document.getElementById('playpause');
+
+      function show(n) {{
+        if (!photoUrls.length) return;
+        i = ((n % photoUrls.length) + photoUrls.length) % photoUrls.length;
+        img.src = photoUrls[i];
+        label.textContent = photoDates[i] + '  (' + (i + 1) + ' / ' + photoUrls.length + ')';
+      }}
+      function tick() {{ show(i + 1); }}
+      function restart() {{
+        if (timer) clearInterval(timer);
+        if (playing && photoUrls.length) timer = setInterval(tick, parseInt(speed.value, 10));
+      }}
+      function setPlaying(p) {{
+        playing = p;
+        if (playBtn) playBtn.textContent = p ? 'pause' : 'play';
+        restart();
+      }}
+
+      if (photoUrls.length) {{
+        document.getElementById('prev').onclick = () => {{ setPlaying(false); show(i - 1); }};
+        document.getElementById('next').onclick = () => {{ setPlaying(false); show(i + 1); }};
+        playBtn.onclick = () => setPlaying(!playing);
+        speed.oninput = restart;
+        show(i);
+        restart();
+      }}
+
+      // nearest date with a photo -- logging is sparser than daily, so an exact match is
+      // the exception, not the rule; the label always says how far off it actually is.
+      function nearestPhotoIndex(dateStr) {{
+        if (!photoDates.length) return -1;
+        const target = new Date(dateStr + 'T00:00:00').getTime();
+        let best = 0, bestDiff = Infinity;
+        for (let k = 0; k < photoDates.length; k++) {{
+          const diff = Math.abs(new Date(photoDates[k] + 'T00:00:00').getTime() - target);
+          if (diff < bestDiff) {{ bestDiff = diff; best = k; }}
+        }}
+        return best;
+      }}
+
+      const svg = document.getElementById('trend-chart');
+      const tip = document.getElementById('hover-tip');
+      if (svg) {{
+        const startDate = new Date(svg.dataset.start + 'T00:00:00');
+        const endDate = new Date(svg.dataset.end + 'T00:00:00');
+        const totalDays = Math.round((endDate - startDate) / 86400000);
+        const padLeft = parseFloat(svg.dataset.padLeft);
+        const plotW = parseFloat(svg.dataset.plotW);
+        const plotTop = svg.dataset.plotTop;
+        const plotBottom = svg.dataset.plotBottom;
+        const viewBoxW = svg.viewBox.baseVal.width;
+
+        let guideLine = null;
+        function guide() {{
+          if (guideLine) return guideLine;
+          guideLine = document.createElementNS('http://www.w3.org/2000/svg', 'line');
+          guideLine.setAttribute('class', 'hover-guide');
+          guideLine.setAttribute('y1', plotTop);
+          guideLine.setAttribute('y2', plotBottom);
+          svg.appendChild(guideLine);
+          return guideLine;
+        }}
+
+        // resolves a client-space mouse x to the viewBox-space x (clamped to the plot area)
+        // and the date it represents -- one source of truth so the guide line, the tooltip,
+        // and the photo lookup can never disagree about what's under the cursor.
+        function hoverInfoAtClientX(clientX) {{
+          const rect = svg.getBoundingClientRect();
+          const scale = viewBoxW / rect.width;
+          const rawX = (clientX - rect.left) * scale;
+          let frac = (rawX - padLeft) / plotW;
+          frac = Math.max(0, Math.min(1, frac));
+          const dayOffset = Math.round(frac * totalDays);
+          const d = new Date(startDate.getTime() + dayOffset * 86400000);
+          return {{ date: d.toISOString().slice(0, 10), x: padLeft + frac * plotW }};
+        }}
+
+        svg.addEventListener('mouseenter', () => {{
+          wasPlaying = playing;
+          if (playing) setPlaying(false);
+        }});
+
+        svg.addEventListener('mousemove', (e) => {{
+          const {{ date: dateStr, x }} = hoverInfoAtClientX(e.clientX);
+
+          const line = guide();
+          line.setAttribute('x1', x);
+          line.setAttribute('x2', x);
+          line.style.display = 'block';
+
+          const w = weightByDate[dateStr];
+          const bf = bfByDate[dateStr];
+          let html = dateStr;
+          html += '<br>Weight: ' + (w !== undefined ? w.toFixed(1) + ' lb' : 'no reading');
+          html += '<br>Body fat: ' + (bf !== undefined ? bf.toFixed(1) + '%' : 'no reading');
+          tip.innerHTML = html;
+          tip.style.display = 'block';
+          tip.style.left = (e.clientX + 14) + 'px';
+          tip.style.top = (e.clientY + 14) + 'px';
+
+          if (photoDates.length) {{
+            const idx = nearestPhotoIndex(dateStr);
+            if (idx >= 0 && idx !== i) {{
+              i = idx;
+              img.src = photoUrls[i];
+              const gapDays = Math.round(
+                Math.abs(new Date(photoDates[i] + 'T00:00:00') - new Date(dateStr + 'T00:00:00'))
+                / 86400000
+              );
+              label.textContent = gapDays === 0
+                ? photoDates[i] + ' (' + (i + 1) + ' / ' + photoUrls.length + ')'
+                : photoDates[i] + ' -- closest photo, ' + gapDays + 'd from hover';
+            }}
+          }}
+        }});
+
+        svg.addEventListener('mouseleave', () => {{
+          tip.style.display = 'none';
+          if (guideLine) guideLine.style.display = 'none';
+          if (wasPlaying) setPlaying(true);
+        }});
+      }}
+    </script>
+    """
 
     return f"""<!doctype html>
 <html><head><meta charset="utf-8">
@@ -158,9 +298,7 @@ async def render_page(conn: sqlite3.Connection, angle: str, days: int, token: st
 <div class="sub">last {days} days</div>
 {_nav(angle, days, token)}
 <div class="stats">{''.join(stats)}</div>
-<div class="charts">
-  <div>{_chart_block(weight)}</div>
-  <div>{_chart_block(bodyfat)}</div>
-</div>
+{chart_html}
 {slideshow}
+{script}
 </body></html>"""

@@ -96,6 +96,39 @@ than a photo of your own body ought to be; the separate token means a leaked das
 (pasted into a chat, sitting in browser history) is not also a working MCP credential, and an
 unset token disables the dashboard rather than defaulting it open.
 
+**Photo-based body-fat estimation is a skill behavior, not a server capability.** When a body
+photo is shared directly in conversation, Claude can offer a rough visual body-fat read the
+same way it already estimates food macros from a photo — see macro-coach's SKILL.md. There is
+no CV/ML pipeline here for it and none is planned: pose landmarks give pixel positions, not a
+real-world scale, so deriving a number from them without a calibration reference (known height,
+fixed camera distance) would produce something that *looks* precise but is closer to a guess —
+exactly what "never imply precision you don't have" (Critical instructions) exists to prevent.
+A visual read is instead logged through the existing `log_body_comp(method="estimate")`, same
+as a typed guess. Because that method value already meant "not a measurement" before this,
+the dashboard's body-fat line draws `estimated: true` points hollow and dashed with an
+"(estimate)" tooltip rather than solid (`charts.dual_axis_chart`'s `right_estimated`, or
+`charts.point_series_chart`'s `estimated` for a standalone single-series use) — so a rough
+guess never sits on the chart looking indistinguishable from a real scale/DEXA reading.
+
+**The dashboard's weight and body-fat lines share one chart, one date-based x-axis.**
+`charts.dual_axis_chart` (2026-08-15) plots both series against every calendar day in the
+window — not, like `point_series_chart`, evenly spaced among whatever non-null points happen
+to exist. That distinction actually matters here: weight (near-daily from garmin-mcp) and body
+fat (logged far less often) would land at inconsistent x-positions for the same date under
+index-based spacing, which breaks the moment anything needs to compare or hover across both
+lines at once. Each series keeps its own y-axis (weight left, body fat right) since they're
+different units; the gridlines themselves are shared (same fractional height), only each axis's
+printed number differs.
+
+Hovering the chart (desktop only — there's no touch equivalent yet) shows the date, weight,
+and body-fat reading at the cursor's position in a small popup, and drives the photo slideshow
+to the nearest photo for that date — explicitly labeled with the gap when it isn't an exact
+match (e.g. "closest photo, 3d from hover"), never presented as if it were the exact date. The
+chart's `<svg>` carries `data-start`/`data-end`/`data-pad-left`/`data-plot-w` attributes
+specifically so the hover JS can invert a pixel position back into a date using the same
+geometry the server drew the chart with, rather than a second, potentially-drifting copy of
+those constants living in JavaScript.
+
 ---
 
 ## Locked decisions
