@@ -125,8 +125,11 @@ CREATE TABLE IF NOT EXISTS day_target (
 );
 
 -- Progress photos. One per (day, angle) -- a later save for the same day+angle overwrites,
--- matching day_target's upsert-by-date pattern. file_path points at a JPEG under PHOTO_DIR;
--- the image itself is never stored in the DB. landmarks_json caches the pose landmarks
+-- matching day_target's upsert-by-date pattern. file_path is just the JPEG's filename
+-- (deterministically "{day}_{angle}.jpg", see body_photos._path_for) -- never an absolute
+-- path, so a DB moved or read from a different host/container than it was written on still
+-- resolves correctly against that process's own PHOTO_DIR. The image itself is never stored
+-- in the DB. landmarks_json caches the pose landmarks
 -- detected at save time (see body_photos.py) so alignment for the dashboard doesn't re-run
 -- pose detection on every render; it is null when detection failed or wasn't available.
 CREATE TABLE IF NOT EXISTS body_photo (

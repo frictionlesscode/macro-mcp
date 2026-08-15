@@ -268,7 +268,7 @@ def save_photo(
                    height = excluded.height, landmarks_json = excluded.landmarks_json,
                    align_status = excluded.align_status, align_reason = excluded.align_reason,
                    note = excluded.note, created_at = excluded.created_at""",
-            (target, angle, str(path), width, height, landmarks_json, align_status,
+            (target, angle, path.name, width, height, landmarks_json, align_status,
              align_reason, note, stamp),
         )
 
@@ -320,14 +320,14 @@ def list_photos(
 def delete_photo(conn: sqlite3.Connection, day: str, angle: str = "front") -> dict[str, Any]:
     require(angle, PHOTO_ANGLES, "angle")
     row = conn.execute(
-        "SELECT file_path FROM body_photo WHERE day = ? AND angle = ?", (day, angle)
+        "SELECT 1 FROM body_photo WHERE day = ? AND angle = ?", (day, angle)
     ).fetchone()
     existed = row is not None
     if existed:
         with transaction(conn):
             conn.execute("DELETE FROM body_photo WHERE day = ? AND angle = ?", (day, angle))
         try:
-            Path(row["file_path"]).unlink(missing_ok=True)
+            _path_for(day, angle).unlink(missing_ok=True)
         except OSError:
             pass
     return {"ok": True, "day": day, "angle": angle, "existed": existed}
@@ -348,7 +348,7 @@ def aligned_jpeg_bytes(conn: sqlite3.Connection, day: str, angle: str = "front")
     if row is None:
         raise ValidationError(f"no {angle} photo stored for {day}")
 
-    img = Image.open(row["file_path"]).convert("RGB")
+    img = Image.open(_path_for(day, angle)).convert("RGB")
     if row["landmarks_json"]:
         landmarks = json.loads(row["landmarks_json"])
         geom = _landmark_geometry(landmarks, row["width"], row["height"])
