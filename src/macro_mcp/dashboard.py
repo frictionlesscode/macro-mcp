@@ -1,14 +1,14 @@
 """Renders the /dashboard page: a combined weight + body-fat % trend chart, and an aligned
-progress-photo slideshow synced to it. server.py owns the route, the token gate, and the
+progress-photo viewer synced to it. server.py owns the route, the token gate, and the
 separate /dashboard/photo image endpoint -- this module only builds HTML and answers "what
 photos are there to show".
 
 No JS framework, no CDN, no build step -- the same reasoning as charts.py: this has to run
-self-hosted behind a Tailscale Funnel with nothing external to fetch. The slideshow is
-vanilla JS that swaps one <img>'s src on a timer; the browser caches each photo after its
-first load, so scrubbing back and forth is instant after the first pass. Hovering the chart
-pauses that timer and drives the same <img> from cursor position instead, via the date-based
-x-axis geometry charts.dual_axis_chart embeds as data-* attributes on its <svg>.
+self-hosted behind a Tailscale Funnel with nothing external to fetch. There is no auto-advancing
+slideshow (removed on request -- the primary interaction is hovering the chart, not watching a
+loop): the photo panel shows the most recent shot, prev/next scrub manually, and hovering the
+chart drives the same <img> from cursor position, via the date-based x-axis geometry
+charts.dual_axis_chart embeds as data-* attributes on its <svg>.
 """
 
 from __future__ import annotations
@@ -33,20 +33,19 @@ _CSS = """
   .stats { display: flex; gap: 24px; margin-bottom: 16px; flex-wrap: wrap; }
   .stat .n { font-size: 22px; font-weight: 600; }
   .stat .l { font-size: 12px; color: #888; }
-  .chart-wrap { max-width: 720px; margin-bottom: 4px; position: relative; }
+  .chart-wrap { width: 80vw; max-width: 1400px; margin: 0 auto 4px; position: relative; }
   .chart-wrap svg { cursor: crosshair; }
-  .chart-note { font-size: 12px; color: #888; margin: 0 0 20px; }
+  .chart-note { max-width: 1400px; margin: 0 auto 20px; font-size: 12px; color: #888; }
   .null { padding: 40px; text-align: center; color: #888; border: 1px dashed #999;
           border-radius: 6px; }
   nav a { margin-right: 10px; font-size: 13px; text-decoration: none; color: #2563eb; }
   nav a.active { font-weight: 600; text-decoration: underline; }
   @media (prefers-color-scheme: dark) { nav a { color: #60a5fa; } }
-  .slideshow { max-width: 480px; }
-  .slideshow img { max-width: 100%; border-radius: 6px; background: #000;
+  .photo-panel { max-width: 480px; margin: 0 auto; }
+  .photo-panel img { max-width: 100%; border-radius: 6px; background: #000;
                     display: block; }
-  .controls { display: flex; align-items: center; gap: 8px; margin-top: 8px;
-              flex-wrap: wrap; font-size: 13px; }
-  .controls input[type=range] { width: 120px; }
+  .controls { display: flex; align-items: center; justify-content: center; gap: 8px;
+              margin-top: 8px; flex-wrap: wrap; font-size: 13px; }
   .controls button { font-size: 13px; padding: 4px 10px; cursor: pointer; }
   .frame-label { font-size: 13px; color: #888; margin-top: 4px; }
   .hover-tip { position: fixed; display: none; pointer-events: none; z-index: 10;
@@ -55,7 +54,9 @@ _CSS = """
 """
 
 
-async def _weight_bodyfat_chart(conn: sqlite3.Connection, days: int) -> dict[str, Any]:
+async def _weight_bodyfat_chart(
+    conn: sqlite3.Connection, days: int, photo_dates: list[str]
+) -> dict[str, Any]:
     """Fetches both series and renders them as one chart. Weight failing to load (garmin-mcp
     unreachable, no token configured, etc.) doesn't block body fat from rendering -- but the
     reason is carried back separately so the page can say why weight is missing rather than
@@ -79,11 +80,21 @@ async def _weight_bodyfat_chart(conn: sqlite3.Connection, days: int) -> dict[str
     # chart marks it distinctly rather than sitting indistinguishable next to scale readings.
     bf_estimated = {p["date"]: p["method"] == "estimate" for p in comp["points"]}
 
+    # A wide window (e.g. "all") requested against a shorter real history would otherwise
+    # plot mostly empty axis -- tighten the start bound to the earliest date actually present
+    # across all three series rather than trusting `days` literally. Only ever moves start
+    # later (toward `end`); a window narrower than the data is left alone.
+    all_dates = list(weight_by_date) + list(bf_by_date) + photo_dates
+    if all_dates:
+        earliest = min(Date.fromisoformat(d) for d in all_dates)
+        start = max(start, earliest)
+
     chart = charts.dual_axis_chart(
         start.isoformat(), end.isoformat(),
         weight_by_date, "Weight (lb)",
         bf_by_date, "Body fat %",
         right_estimated=bf_estimated,
+        photo_dates=photo_dates,
     )
     return {
         "chart": chart,
@@ -99,20 +110,21 @@ def _nav(angle: str, days: int, token: str) -> str:
     for a in PHOTO_ANGLES:
         cls = ' class="active"' if a == angle else ""
         links.append(f'<a{cls} href="/dashboard?angle={a}&days={days}&token={token}">{a}</a>')
-    for d in (30, 90, 180, 365):
+    for d in (30, 90, 180, 365, 3650):
         cls = ' class="active"' if d == days else ""
-        links.append(f'<a{cls} href="/dashboard?angle={angle}&days={d}&token={token}">{d}d</a>')
+        label = "all" if d == 3650 else f"{d}d"
+        links.append(f'<a{cls} href="/dashboard?angle={angle}&days={d}&token={token}">{label}</a>')
     return f"<nav>{''.join(links)}</nav>"
 
 
 async def render_page(conn: sqlite3.Connection, angle: str, days: int, token: str) -> str:
-    trend = await _weight_bodyfat_chart(conn, days)
-    chart = trend["chart"]
-
     start = Date.fromordinal(today().toordinal() - days + 1)
     listing = body_photos.list_photos(conn, angle=angle, start=start.isoformat())
     photo_days = [p["day"] for p in listing["photos"]]
     unaligned_count = sum(1 for p in listing["photos"] if p["align_status"] != "ok")
+
+    trend = await _weight_bodyfat_chart(conn, days, photo_days)
+    chart = trend["chart"]
 
     stats = []
     if trend["latest_bf"] is not None:
@@ -130,16 +142,13 @@ async def render_page(conn: sqlite3.Connection, angle: str, days: int, token: st
 
     if photo_days:
         urls = [f"/dashboard/photo?day={d}&angle={angle}&token={token}" for d in photo_days]
-        slideshow = f"""
-        <div class="slideshow">
+        photo_panel = f"""
+        <div class="photo-panel">
           <img id="slide" src="{urls[-1]}" alt="progress photo">
           <div class="frame-label" id="frame-label"></div>
           <div class="controls">
             <button type="button" id="prev">&larr; prev</button>
-            <button type="button" id="playpause">pause</button>
             <button type="button" id="next">next &rarr;</button>
-            <label>speed <input type="range" id="speed" min="200" max="3000" step="100"
-                                 value="900"></label>
           </div>
           {f'<div class="frame-label">{unaligned_count} of {len(photo_days)} unaligned '
            f'(no clear pose detected) -- shown as originally framed</div>' if unaligned_count else ''}
@@ -147,8 +156,8 @@ async def render_page(conn: sqlite3.Connection, angle: str, days: int, token: st
         """
     else:
         urls = []
-        slideshow = (f'<div class="null">no {escape(angle)} photos stored in this window '
-                     f'(see log_body_photo)</div>')
+        photo_panel = (f'<div class="null">no {escape(angle)} photos stored in this window '
+                        f'(see log_body_photo)</div>')
 
     script = f"""
     <div class="hover-tip" id="hover-tip"></div>
@@ -158,11 +167,9 @@ async def render_page(conn: sqlite3.Connection, angle: str, days: int, token: st
       const weightByDate = {json.dumps(trend["weight_by_date"])};
       const bfByDate = {json.dumps(trend["bf_by_date"])};
 
-      let i = photoUrls.length - 1, playing = true, timer = null, wasPlaying = true;
+      let i = photoUrls.length - 1;
       const img = document.getElementById('slide');
       const label = document.getElementById('frame-label');
-      const speed = document.getElementById('speed');
-      const playBtn = document.getElementById('playpause');
 
       function show(n) {{
         if (!photoUrls.length) return;
@@ -170,24 +177,11 @@ async def render_page(conn: sqlite3.Connection, angle: str, days: int, token: st
         img.src = photoUrls[i];
         label.textContent = photoDates[i] + '  (' + (i + 1) + ' / ' + photoUrls.length + ')';
       }}
-      function tick() {{ show(i + 1); }}
-      function restart() {{
-        if (timer) clearInterval(timer);
-        if (playing && photoUrls.length) timer = setInterval(tick, parseInt(speed.value, 10));
-      }}
-      function setPlaying(p) {{
-        playing = p;
-        if (playBtn) playBtn.textContent = p ? 'pause' : 'play';
-        restart();
-      }}
 
       if (photoUrls.length) {{
-        document.getElementById('prev').onclick = () => {{ setPlaying(false); show(i - 1); }};
-        document.getElementById('next').onclick = () => {{ setPlaying(false); show(i + 1); }};
-        playBtn.onclick = () => setPlaying(!playing);
-        speed.oninput = restart;
+        document.getElementById('prev').onclick = () => show(i - 1);
+        document.getElementById('next').onclick = () => show(i + 1);
         show(i);
-        restart();
       }}
 
       // nearest date with a photo -- logging is sparser than daily, so an exact match is
@@ -240,11 +234,6 @@ async def render_page(conn: sqlite3.Connection, angle: str, days: int, token: st
           return {{ date: d.toISOString().slice(0, 10), x: padLeft + frac * plotW }};
         }}
 
-        svg.addEventListener('mouseenter', () => {{
-          wasPlaying = playing;
-          if (playing) setPlaying(false);
-        }});
-
         svg.addEventListener('mousemove', (e) => {{
           const {{ date: dateStr, x }} = hoverInfoAtClientX(e.clientX);
 
@@ -282,7 +271,6 @@ async def render_page(conn: sqlite3.Connection, angle: str, days: int, token: st
         svg.addEventListener('mouseleave', () => {{
           tip.style.display = 'none';
           if (guideLine) guideLine.style.display = 'none';
-          if (wasPlaying) setPlaying(true);
         }});
       }}
     </script>
@@ -299,6 +287,6 @@ async def render_page(conn: sqlite3.Connection, angle: str, days: int, token: st
 {_nav(angle, days, token)}
 <div class="stats">{''.join(stats)}</div>
 {chart_html}
-{slideshow}
+{photo_panel}
 {script}
 </body></html>"""

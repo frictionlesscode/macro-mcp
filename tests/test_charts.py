@@ -119,13 +119,16 @@ def test_dual_axis_chart_renders_with_only_one_side_populated():
     assert 'class="intake-line"' in result["svg"]
 
 
-def test_dual_axis_chart_gaps_break_the_line_not_zero():
+def test_dual_axis_chart_connects_across_gaps_with_a_straight_line():
+    """Missing days are interpolated visually (one continuous line, no invented point at
+    the gap) rather than breaking the line -- no fabricated data, just a straight line
+    between the two real readings on either side.
+    """
     left = {"2026-09-01": 180.0, "2026-09-05": 178.0}  # gap on 09-02..09-04
     result = charts.dual_axis_chart("2026-09-01", "2026-09-05", left, "Weight (lb)", {}, "Body fat %")
-    # two disconnected M...  segments, not one continuous L path across the gap
-    assert result["svg"].count("<path") >= 1
     path = result["svg"].split('class="intake-line" d="')[1].split('"')[0]
-    assert path.count("M") == 2
+    assert path.count("M") == 1
+    assert path.count("L") == 1
 
 
 def test_dual_axis_chart_marks_estimated_right_points():

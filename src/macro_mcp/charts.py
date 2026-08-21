@@ -55,6 +55,7 @@ _STYLE = """
   .legend-left { fill: #2563eb; font: 11px system-ui, sans-serif; }
   .legend-right { fill: #ea580c; font: 11px system-ui, sans-serif; }
   .hover-guide { stroke: #999999; stroke-width: 1; stroke-dasharray: 3 2; display: none; }
+  .photo-marker { fill: none; stroke: #a855f7; stroke-width: 1.5; }
   .target-line { stroke: #16a34a; stroke-width: 1.5; fill: none; stroke-dasharray: 4 3; }
   .target-band { fill: #16a34a; opacity: 0.10; }
   .bar-over { fill: #dc2626; }
@@ -73,6 +74,7 @@ _STYLE = """
     .bf-line { stroke: #fb923c; }
     .bf-dot { fill: #fb923c; }
     .bf-estimate-dot { stroke: #fb923c; }
+    .photo-marker { stroke: #c084fc; }
     .legend-left { fill: #60a5fa; }
     .legend-right { fill: #fb923c; }
     .hover-guide { stroke: #6e6e73; }
@@ -330,6 +332,7 @@ def dual_axis_chart(
     right: Mapping[str, float],
     right_label: str,
     right_estimated: Mapping[str, bool] | None = None,
+    photo_dates: Sequence[str] | None = None,
     title: str | None = None,
 ) -> dict[str, Any]:
     """Two trend lines sharing one date-based x-axis, each with its own y-axis -- built for
@@ -424,16 +427,16 @@ def dual_axis_chart(
         if not bounds:
             return
         lo, hi = bounds
+        # Connects across missing days with a straight line rather than breaking -- days
+        # without a reading are interpolated visually, not fabricated as data (no new point
+        # is added, no value is invented; the line is just drawn between the two real ones).
         path_cmds: list[str] = []
-        pen_down = False
         for i, d in enumerate(dates):
             v = values.get(d)
             if v is None:
-                pen_down = False
                 continue
-            cmd = "L" if pen_down else "M"
+            cmd = "L" if path_cmds else "M"
             path_cmds.append(f"{cmd}{x_of(i):.1f},{y_of(v, lo, hi):.1f}")
-            pen_down = True
         parts.append(f'<path class="{line_cls}" d="{" ".join(path_cmds)}"/>')
 
         for i, d in enumerate(dates):
@@ -449,6 +452,45 @@ def dual_axis_chart(
 
     draw_series(left, left_bounds, "intake-line", "intake-dot", "estimate-dot", {})
     draw_series(right, right_bounds, "bf-line", "bf-dot", "bf-estimate-dot", right_estimated)
+
+    # a photo on a date -- ring the weight *line* at that x, same as the eye would read it
+    # off the chart, even on a day with no real weigh-in: the line itself already connects
+    # across gaps (see draw_series above), so the marker interpolates along that same
+    # straight segment rather than inventing a different rule that disagrees with what's
+    # drawn. Days before/after every known point flat-extrapolate from the nearest edge
+    # value -- still a real number on the line, never a fabricated one.
+    if photo_dates:
+        known = sorted(
+            ((Date.fromisoformat(d) - start_d).days, v)
+            for d, v in left.items() if v is not None
+        )
+        lo, hi = left_bounds or (0.0, 1.0)
+
+        def interpolated_weight(qi: int) -> float | None:
+            if not known:
+                return None
+            if qi <= known[0][0]:
+                return known[0][1]
+            if qi >= known[-1][0]:
+                return known[-1][1]
+            for (i0, v0), (i1, v1) in zip(known, known[1:]):
+                if i0 <= qi <= i1:
+                    if i1 == i0:
+                        return v0
+                    return v0 + (v1 - v0) * (qi - i0) / (i1 - i0)
+            return None  # unreachable given the bounds checks above
+
+        baseline_y = HEIGHT - PAD_BOTTOM
+        for photo_day in photo_dates:
+            i = (Date.fromisoformat(photo_day) - start_d).days
+            if not (0 <= i < n):
+                continue
+            v = interpolated_weight(i)
+            cy = y_of(v, lo, hi) if (v is not None and left_bounds) else baseline_y
+            parts.append(
+                f'<circle class="photo-marker" cx="{x_of(i):.1f}" cy="{cy:.1f}" '
+                f'r="6">{_tooltip(f"{photo_day}: photo available")}</circle>'
+            )
 
     stride = max(1, n // 8)
     for i in range(0, n, stride):
