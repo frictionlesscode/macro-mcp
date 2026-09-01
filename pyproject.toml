@@ -2,7 +2,7 @@
 name = "macro-mcp"
 version = "0.1.0"
 description = "Nutrition logging, macro-target tracking, and adherence trends, exposed to Claude over MCP"
-requires-python = ">=3.11"
+requires-python = ">=3.12"
 license = { text = "MIT" }
 dependencies = [
     "python-dotenv>=1.0",
