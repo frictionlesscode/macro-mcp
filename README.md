@@ -1,5 +1,7 @@
 # macro-mcp
 
+> **Unofficial personal project.** Not affiliated with or endorsed by any nutrition, fitness, or device company. It runs entirely on your own machine; the only optional outbound call is to your own [garmin-mcp](https://github.com/frictionlesscode/garmin-mcp) instance for a weight trend.
+
 A self-hosted [MCP](https://modelcontextprotocol.io) server that turns Claude into a nutrition
 log: you tell it what you ate (or photograph it), it logs the numbers, and it tracks intake
 against whatever macro targets you set — trend statistics, adherence, and server-rendered
