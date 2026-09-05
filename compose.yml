@@ -1,0 +1,26 @@
+services:
+  macro-mcp:
+    build: .
+    image: macro-mcp:latest
+    container_name: macro-mcp
+    restart: unless-stopped
+    ports:
+      - "127.0.0.1:18081:8080"
+    environment:
+      - MCP_BEARER_TOKEN=${MCP_BEARER_TOKEN}
+      - MCP_PUBLIC_URL=${MCP_PUBLIC_URL}
+      - GARMIN_MCP_URL=${GARMIN_MCP_URL}
+      - GARMIN_MCP_TOKEN=${GARMIN_MCP_TOKEN}
+      # Gates /dashboard (progress photos + weight/body-fat trend). A separate secret from
+      # MCP_BEARER_TOKEN on purpose -- see server.py's _dashboard_authorized. Unset means the
+      # dashboard is disabled (fails closed), not open.
+      - DASHBOARD_TOKEN=${DASHBOARD_TOKEN}
+    volumes:
+      - ./data:/data
+    extra_hosts:
+      # Lets GARMIN_MCP_URL point at host.docker.internal:18080 to reach garmin-mcp's own
+      # container, which is bound to 127.0.0.1 on the *host* -- from inside this container,
+      # "127.0.0.1" means itself, not the host, so a plain 127.0.0.1 URL would silently
+      # never reach garmin-mcp. Docker Desktop (Windows/Mac) provides this DNS name natively;
+      # this mapping makes the same name work on Linux too.
+      - "host.docker.internal:host-gateway"

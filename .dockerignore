@@ -1,0 +1,9 @@
+.git
+.venv
+data/
+*.db
+__pycache__/
+*.pyc
+.env
+tests/
+export/
